@@ -63,22 +63,27 @@ def load_main_grid_from_csv(csv_path, date_col, wkt_col, grid_id_col):
     return gdf, grid_id_col
 
 def classify_category(row) -> str:
-    a  = row.get("amenity")
-    sf = row.get("social_facility")
-    hw = row.get("highway", "") or ""
-    br = row.get("bridge", "") or ""
+    a  = row.get("amenity", "")
+    sf = row.get("social_facility", "")
+    hw = row.get("highway", "")
+    br = row.get("bridge", "")
 
+    # Homeless shelters (explicit)
     if a == "social_facility" and sf == "shelter":
         return "shelter_homeless"
+    # Generic shelters (bus/picnic)
     if a == "shelter":
         return "shelter_generic"
-    if a in {"restaurant", "school", "college", "university"}:
+    # Core amenities
+    if a in {"restaurant", "school", "college", "university", "fast_food", "bank", "atm", "place_of_worship", "bench", "police", "cinema"}:
         return a
-    if br == "yes":
+    # Infrastructure
+    if br in {"yes", "true", "1"}:
         return "bridge"
-    if hw.endswith("_link"):
+    if isinstance(hw, str) and hw.endswith("_link"):
         return "highway_link"
     return "other"
+
 
 def year_to_snapshot(d: pd.Timestamp) -> pd.Timestamp:
     """Map any daily date to snapshot (EOY for 2016–2023; 2024-05-31)."""
@@ -115,6 +120,12 @@ amen_gdf = gpd.GeoDataFrame(
 )
 if amen_gdf.crs != grid_unique.crs:
     amen_gdf = amen_gdf.to_crs(grid_unique.crs)
+
+# Make sure these columns exist and are lowercase strings (no NaNs)
+for col in ["amenity", "social_facility", "highway", "bridge"]:
+    if col not in amen_gdf.columns:
+        amen_gdf[col] = pd.Series(pd.NA, index=amen_gdf.index)
+    amen_gdf[col] = amen_gdf[col].astype("string").str.lower().fillna("")
 
 amen_gdf["category"] = amen_gdf.apply(classify_category, axis=1)
 snapshots = amen_gdf["snapshot_date"].drop_duplicates().sort_values().tolist()
@@ -157,7 +168,7 @@ else:
     ).drop(columns="key").fillna(0)
 
 # Optional total (amenities only; exclude infra if you want)
-core = ["n_restaurant", "n_school", "n_college", "n_university", "n_shelter_homeless", "n_shelter_generic"]
+core = ["n_restaurant", "n_school", "n_college", "n_university", "n_fast_food", "n_bank", "n_atm", "n_place_of_worship", "n_bench", "n_police", "n_cinema", "n_shelter_homeless", "n_shelter_generic"]
 for c in core:
     if c not in snap_counts.columns:
         snap_counts[c] = 0
