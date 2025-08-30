@@ -1,22 +1,21 @@
-# Requires: pip install requests pandas geopandas shapely pyproj
-
 import requests
 import time
 import pandas as pd
 import geopandas as gpd
 from shapely.geometry import Point
+from datetime import datetime
 
 OVERPASS_URL = "https://overpass-api.de/api/interpreter"
 NOMINATIM_URL = "https://nominatim.openstreetmap.org/search"
 
 HEADERS = {
-    "User-Agent": "SF-OSM-amenities-script/1.0 (contact: wjung@psu.edu)"
+    "User-Agent": "SF-OSM-amenities-historical/1.0 (contact: wjung@psu.edu)"
 }
 
 def get_area_id(place_query="San Francisco, California, USA"):
     """
-    Use Nominatim to look up the OSM relation for 'place_query'
-    and convert it to an Overpass 'area' id (relation_id + 3600000000).
+    Resolve the OSM relation id using Nominatim and convert to Overpass 'area' id.
+    (We only need this once; Overpass will time-travel the data via the [date:...] clause.)
     """
     params = {
         "q": place_query,
@@ -34,66 +33,47 @@ def get_area_id(place_query="San Francisco, California, USA"):
     osm_type = results[0].get("osm_type")
     osm_id = int(results[0].get("osm_id"))
 
-    # Overpass 'area' ids are:
-    # - relation: 3600000000 + osm_id
-    # - way:      3600000000 + osm_id  (not typical for admin boundaries)
-    # - node:     3600000000 + osm_id  (rare for areas)
-    if osm_type == "relation":
-        area_id = 3600000000 + osm_id
-    elif osm_type == "way":
-        area_id = 3600000000 + osm_id
-    elif osm_type == "node":
-        area_id = 3600000000 + osm_id
-    else:
+    if osm_type not in {"relation", "way", "node"}:
         raise ValueError(f"Unexpected osm_type from Nominatim: {osm_type}")
 
-    return area_id
+    return 3600000000 + osm_id
 
-def build_overpass_query(area_id):
+def build_overpass_query(area_id, snapshot_iso):
     """
-    Build a single Overpass QL query that fetches:
-      - amenity = restaurant, school (and higher ed), shelter variants
-      - social_facility=shelter (often how homeless shelters are tagged)
+    Build a historical Overpass QL query at the given snapshot time (UTC ISO string).
+    We include:
+      - amenity={restaurant, school, college, university, shelter, social_facility}
+      - social_facility=shelter (homeless shelters)
       - ways/relations with bridge=yes
-      - highway link/ramps (motorway_link, trunk_link, primary_link, etc.)
-    We ask Overpass to provide 'center' for ways/relations so we can map them as points.
+      - highway=*_link (ramps)
+    We ask for 'center' so ways/relations get point centroids for easy mapping.
     """
-    # Amenity patterns (keep simple & explicit)
     amenity_set = [
-        "restaurant", "fast_food", "school", "college", "university",
+        "restaurant", "school", "college", "university",
         "shelter", "social_facility"
     ]
-
     amenity_regex = "|".join(amenity_set)
-
-    # Highway ramps: usually *_link (e.g., motorway_link, trunk_link, primary_link)
     ramps_regex = ".*_link"
 
-    # Query:
-    # - Pull nodes/ways/relations for amenities
-    # - Specifically pull the homeless-shelter schema via social_facility=shelter
-    # - Pull bridges (bridge=yes) from ways & relations
-    # - Pull highway links (ramps)
-    # - 'out tags center;' gives tags and a computed center for ways/relations
     query = f"""
-    [out:json][timeout:180];
+    [out:json][timeout:180][date:"{snapshot_iso}"];
     area({area_id})->.searchArea;
     (
-      // General amenities (including 'social_facility' as an amenity tag)
+      // amenities (incl. social_facility as amenity)
       node["amenity"~"^{amenity_regex}$"](area.searchArea);
       way["amenity"~"^{amenity_regex}$"](area.searchArea);
       relation["amenity"~"^{amenity_regex}$"](area.searchArea);
 
-      // Homeless shelters tagging pattern:
+      // explicit homeless shelters
       node["amenity"="social_facility"]["social_facility"="shelter"](area.searchArea);
       way["amenity"="social_facility"]["social_facility"="shelter"](area.searchArea);
       relation["amenity"="social_facility"]["social_facility"="shelter"](area.searchArea);
 
-      // Bridges
+      // bridges
       way["bridge"="yes"](area.searchArea);
       relation["bridge"="yes"](area.searchArea);
 
-      // Highway ramps
+      // highway ramps (links)
       way["highway"~"{ramps_regex}"](area.searchArea);
       relation["highway"~"{ramps_regex}"](area.searchArea);
     );
@@ -101,34 +81,32 @@ def build_overpass_query(area_id):
     """
     return query
 
-def run_overpass(query, max_tries=3, backoff=10):
+def run_overpass(query, max_tries=4, backoff=12):
     """
-    Run the Overpass query with light retry/backoff for courtesy.
+    Execute Overpass query with gentle retry/backoff for rate limits / transient errors.
     """
     for attempt in range(1, max_tries + 1):
         try:
             resp = requests.post(OVERPASS_URL, data={"data": query}, headers=HEADERS, timeout=300)
-            if resp.status_code == 429 or "Too Many Requests" in resp.text:
-                # Rate-limited; wait and retry
+            # Handle rate limiting explicitly
+            if resp.status_code in (429, 504) or "Too Many Requests" in resp.text:
                 time.sleep(backoff * attempt)
                 continue
             resp.raise_for_status()
             return resp.json()
-        except requests.RequestException as e:
+        except requests.RequestException:
             if attempt == max_tries:
                 raise
             time.sleep(backoff * attempt)
     raise RuntimeError("Failed to fetch Overpass data after retries.")
 
-def to_geodataframe(overpass_json):
+def to_geodataframe(overpass_json, snapshot_date_str):
     """
-    Convert Overpass JSON to a GeoDataFrame with point geometries.
-    - For nodes: use lat/lon
-    - For ways/relations: use 'center' (provided by 'out center')
+    Convert Overpass JSON to GeoDataFrame (point geometries).
     Adds:
-      - osm_type (node/way/relation)
-      - osm_id
-      - feature_type (amenity/bridge/highway_link...)
+      - snapshot_date (YYYY-MM-DD)
+      - osm_type/osm_id/tags
+      - feature_type convenience label
     """
     elements = overpass_json.get("elements", [])
     recs = []
@@ -137,10 +115,8 @@ def to_geodataframe(overpass_json):
         osm_id   = el.get("id")
         tags     = el.get("tags", {}) or {}
 
-        # Determine a simple 'feature_type' label for convenience
-        feature_type = None
+        # Simple labeling
         if "amenity" in tags:
-            # prioritize 'social_facility=shelter' labeling when applicable
             if tags.get("amenity") == "social_facility" and tags.get("social_facility") == "shelter":
                 feature_type = "shelter"
             else:
@@ -149,12 +125,12 @@ def to_geodataframe(overpass_json):
             feature_type = "shelter"
         elif tags.get("bridge") == "yes":
             feature_type = "bridge"
-        elif "highway" in tags and tags.get("highway", "").endswith("_link"):
+        elif "highway" in tags and str(tags.get("highway","")).endswith("_link"):
             feature_type = "highway_link"
         else:
             feature_type = "other"
 
-        # Geometry
+        # Geometry as point
         if osm_type == "node":
             lat = el.get("lat")
             lon = el.get("lon")
@@ -164,10 +140,10 @@ def to_geodataframe(overpass_json):
             lon = center.get("lon") if center else None
 
         if lat is None or lon is None:
-            # Occasionally, an element might be missing center; skip to keep things simple
             continue
 
-        rec = {
+        recs.append({
+            "snapshot_date": snapshot_date_str,
             "osm_type": osm_type,
             "osm_id": osm_id,
             "name": tags.get("name"),
@@ -176,11 +152,10 @@ def to_geodataframe(overpass_json):
             "social_facility": tags.get("social_facility"),
             "highway": tags.get("highway"),
             "bridge": tags.get("bridge"),
-            "tags": tags,   # keep full tag dict for reference
+            "tags": tags,
             "lat": lat,
             "lon": lon,
-        }
-        recs.append(rec)
+        })
 
     df = pd.DataFrame(recs)
     if df.empty:
@@ -193,34 +168,77 @@ def to_geodataframe(overpass_json):
     )
     return gdf
 
-def fetch_sf_amenities(place="San Francisco, California, USA", save_geojson=None, save_csv=None):
+def fetch_sf_amenities_by_year(
+    place="San Francisco, California, USA",
+    save_per_year=False,
+    per_year_basename="sf_osm_{year}.geojson",
+    save_combined_geojson=None,
+    save_combined_csv=None,
+    polite_pause=6
+):
     """
-    End-to-end convenience function:
-      - resolve area id
-      - query Overpass
-      - return GeoDataFrame (WGS84)
-      - optionally save to GeoJSON/CSV
+    For each year, query snapshot:
+      - 2016..2023 at Dec 31 (23:59:59Z)
+      - 2024 at May 31 (23:59:59Z)
+    Returns a combined GeoDataFrame. Optionally saves per-year and/or combined outputs.
     """
+    # Build the date list you requested
+    dates = []
+    for year in range(2016, 2024):
+        dates.append(f"{year}-12-31")
+    dates.append("2024-05-31")
+
     area_id = get_area_id(place)
-    query = build_overpass_query(area_id)
-    data = run_overpass(query)
-    gdf = to_geodataframe(data)
 
-    # Optional saves
-    if save_geojson:
-        gdf.to_file(save_geojson, driver="GeoJSON")
-    if save_csv:
-        # For CSV, drop the geometry or split lon/lat
-        cols = [c for c in gdf.columns if c != "geometry"]
-        gdf[cols].to_csv(save_csv, index=False)
+    all_gdfs = []
+    for d in dates:
+        # Use end-of-day UTC to include the full date’s edits
+        snap_iso = f"{d}T23:59:59Z"
+        q = build_overpass_query(area_id, snap_iso)
+        data = run_overpass(q)
+        gdf = to_geodataframe(data, snapshot_date_str=d)
+        all_gdfs.append(gdf)
 
-    return gdf
+        if save_per_year:
+            # One file per year/date — include the date in filename for clarity
+            year = d[:4]
+            out_path = per_year_basename.format(year=year)
+            # If you want unique filenames per exact date, do:
+            # out_path = per_year_basename.format(year=d)
+            if not gdf.empty:
+                gdf.to_file(out_path, driver="GeoJSON")
+            else:
+                # Write an empty placeholder GeoJSON if desired; otherwise skip
+                pass
+
+        # Be polite to Overpass
+        time.sleep(polite_pause)
+
+    if len(all_gdfs) == 0:
+        return gpd.GeoDataFrame(columns=["snapshot_date"], geometry=[], crs="EPSG:4326")
+
+    combined = pd.concat(all_gdfs, ignore_index=True)
+    combined_gdf = gpd.GeoDataFrame(combined, geometry="geometry", crs="EPSG:4326")
+
+    # Optional combined saves
+    if save_combined_geojson:
+        combined_gdf.to_file(save_combined_geojson, driver="GeoJSON")
+    if save_combined_csv:
+        cols = [c for c in combined_gdf.columns if c != "geometry"]
+        combined_gdf[cols].to_csv(save_combined_csv, index=False)
+
+    return combined_gdf
 
 if __name__ == "__main__":
-    gdf = fetch_sf_amenities(
+    # Example usage:
+    gdf_all = fetch_sf_amenities_by_year(
         place="San Francisco, California, USA",
-        save_geojson="data/sf_osm_amenities_links_bridges.geojson",
-        save_csv="data/sf_osm_amenities_links_bridges.csv"
+        save_per_year=True,                         # set to False if you don't want per-year files
+        per_year_basename="sf_osm_amenities_{year}.geojson",
+        save_combined_geojson="sf_osm_amenities_2016_2024.geojson",
+        save_combined_csv="sf_osm_amenities_2016_2024.csv",
+        polite_pause=8                              # increase if you hit rate limits
     )
-    print(f"Fetched {len(gdf)} features.")
-    print(gdf.head(5))
+    print(f"Total features across snapshots: {len(gdf_all)}")
+    print(gdf_all.groupby('snapshot_date')['osm_id'].count())
+    print(gdf_all.head())
