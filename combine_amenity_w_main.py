@@ -9,8 +9,8 @@ MAIN_DATE_COL   = "timestamp"
 MAIN_GEOM_COL   = "geometry_bbox"
 MAIN_GRID_IDCOL = "bbox_id"
 
-AMENITIES_CSV   = "/data/sf_osm_amenities_2016_2024.csv"   # from the Overpass step
-OUTPUT_PATH     = "/data/main_daily_with_amenities.parquet"
+AMENITIES_CSV   = "data/sf_osm_amenities_2016_2024.csv"   # from the Overpass step
+OUTPUT_PATH     = "data/main_daily_with_amenities.parquet"
 
 # Which amenity buckets to attach
 CATS = [
