@@ -234,9 +234,9 @@ if __name__ == "__main__":
     gdf_all = fetch_sf_amenities_by_year(
         place="San Francisco, California, USA",
         save_per_year=True,                         # set to False if you don't want per-year files
-        per_year_basename="sf_osm_amenities_{year}.geojson",
-        save_combined_geojson="sf_osm_amenities_2016_2024.geojson",
-        save_combined_csv="sf_osm_amenities_2016_2024.csv",
+        per_year_basename="data/sf_osm_amenities_{year}.geojson",
+        save_combined_geojson="data/sf_osm_amenities_2016_2024.geojson",
+        save_combined_csv="data/sf_osm_amenities_2016_2024.csv",
         polite_pause=8                              # increase if you hit rate limits
     )
     print(f"Total features across snapshots: {len(gdf_all)}")
