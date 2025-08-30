@@ -14,14 +14,12 @@ OUTPUT_PATH     = "/data/main_daily_with_amenities.parquet"
 
 # Which amenity buckets to attach
 CATS = [
-    "restaurant", "school", "college", "university",
+    "restaurant", "school", "college", "university", "fast_food", "bank", "atm", "place_of_worship", "bench", "police", "cinema",
     "shelter_homeless", "shelter_generic",
     "bridge", "highway_link",
 ]
 
-# =========================
 # Helpers
-# =========================
 def load_main_grid_from_csv(csv_path, date_col, wkt_col, grid_id_col):
     """Load daily CSV with WKT polygons -> GeoDataFrame (EPSG:4326).
        Ensures date dtype, repair invalid polygons, ensure a grid_id."""
@@ -89,9 +87,8 @@ def year_to_snapshot(d: pd.Timestamp) -> pd.Timestamp:
         raise ValueError(f"Date {d.date()} outside supported range 2016-01-01..2024-05-31.")
     return pd.Timestamp("2024-05-31") if y == 2024 else pd.Timestamp(f"{y}-12-31")
 
-# =========================
+
 # Load main daily grid (CSV+WKT)
-# =========================
 main_gdf, GRID_ID_COL = load_main_grid_from_csv(
     MAIN_CSV_PATH, MAIN_DATE_COL, MAIN_GEOM_COL, MAIN_GRID_IDCOL
 )
@@ -101,9 +98,7 @@ grid_unique = main_gdf[[GRID_ID_COL, "geometry"]].drop_duplicates(subset=[GRID_I
 if grid_unique.crs is None:
     grid_unique.set_crs("EPSG:4326", inplace=True)
 
-# =========================
 # Load OSM amenities
-# =========================
 amen = pd.read_csv(AMENITIES_CSV)
 need = {"snapshot_date", "lat", "lon", "amenity", "social_facility", "highway", "bridge", "osm_type", "osm_id"}
 missing = need - set(amen.columns)
@@ -124,9 +119,7 @@ if amen_gdf.crs != grid_unique.crs:
 amen_gdf["category"] = amen_gdf.apply(classify_category, axis=1)
 snapshots = amen_gdf["snapshot_date"].drop_duplicates().sort_values().tolist()
 
-# =========================
 # Count amenities per grid per snapshot
-# =========================
 per_snap = []
 for snap in snapshots:
     pts = amen_gdf.loc[amen_gdf["snapshot_date"] == snap, ["category", "geometry"]].copy()
@@ -169,6 +162,7 @@ for c in core:
     if c not in snap_counts.columns:
         snap_counts[c] = 0
 snap_counts["n_amenities_total"] = snap_counts[core].sum(axis=1)
+
 
 # =========================
 # Map each daily row to its snapshot & merge
