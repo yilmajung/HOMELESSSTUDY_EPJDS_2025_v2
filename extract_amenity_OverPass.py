@@ -42,14 +42,14 @@ def build_overpass_query(area_id, snapshot_iso):
     """
     Build a historical Overpass QL query at the given snapshot time (UTC ISO string).
     We include:
-      - amenity={restaurant, school, college, university, shelter, social_facility}
+      - amenity={restaurant, school, college, university, shelter, social_facility, fast_food, bank, atm, place_of_worship, bench, police, cinema}
       - social_facility=shelter (homeless shelters)
       - ways/relations with bridge=yes
       - highway=*_link (ramps)
     We ask for 'center' so ways/relations get point centroids for easy mapping.
     """
     amenity_set = [
-        "restaurant", "school", "college", "university",
+        "restaurant", "school", "college", "university", "fast_food", "bank", "atm", "place_of_worship", "bench", "police", "cinema",
         "shelter", "social_facility"
     ]
     amenity_regex = "|".join(amenity_set)
