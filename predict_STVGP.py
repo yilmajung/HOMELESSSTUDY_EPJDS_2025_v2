@@ -12,6 +12,7 @@ import re
 from gpytorch.mlls import VariationalELBO
 from gpytorch.utils.quadrature import GaussHermiteQuadrature1D
 from gpytorch.likelihoods import _OneDimensionalLikelihood
+import geopandas as gpd
 
 # Load the necessary files
 print("Loading saved artifacts...")
