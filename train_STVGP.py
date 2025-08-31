@@ -60,11 +60,10 @@ amen_feat_cols = [f"log1p_{c}" for c in amen_cols]
 X_cols = base_covs + amen_feat_cols
 
 # Extract arrays for GP
-spatial_coords  = np.column_stack([df_training.get("latitude", pd.Series(lat, index=df_training.index)).values,
-                                   df_training.get("longitude", pd.Series(lon, index=df_training.index)).values]).astype(np.float32)
-temporal_coords = df_training.get("timestamp", pd.Series(timestamp, index=df_training.index)).values.astype(np.float32).reshape(-1, 1)
-X_covariates    = df_training[X_cols].astype(np.float32).values
-y_counts        = df_training["ground_truth"].astype(np.float32).values
+spatial_coords = df_training[['latitude', 'longitude']].values
+temporal_coords = df_training[['timestamp']].values
+X_covariates = df_training[X_cols].astype(np.float32).values
+y_counts = df_training['ground_truth'].values
 
 # Inducing points selection (use bboxid if available, else grid_id)
 print("Selecting inducing points…")
@@ -82,11 +81,8 @@ inducing_ids = np.unique(np.concatenate([top_density_ids, random_ids]))
 inducing_df  = df_training[df_training[cell_id_col].isin(inducing_ids)].drop_duplicates(subset=[cell_id_col])
 
 # Build inducing arrays
-Z_spatial    = np.column_stack([
-    inducing_df.get("latitude", pd.Series(lat, index=inducing_df.index)).values,
-    inducing_df.get("longitude", pd.Series(lon, index=inducing_df.index)).values
-]).astype(np.float32)
-Z_temporal   = inducing_df.get("timestamp", pd.Series(timestamp, index=inducing_df.index)).values.astype(np.float32).reshape(-1, 1)
+Z_spatial = inducing_df[['latitude','longitude']].values
+Z_temporal = inducing_df[['timestamp']].values
 Z_covariates = inducing_df[X_cols].astype(np.float32).values
 
 # Sanity checks
