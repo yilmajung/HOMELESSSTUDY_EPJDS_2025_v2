@@ -49,7 +49,7 @@ class STVGPModel(gpytorch.models.ApproximateGP):
         s, t, c = x[:, :2], x[:, 2:3], x[:, 3:]
         # Constant mean uses covariates to determine batch shape
         mean_x = self.mean_module(c)
-        mean_x = mean_x.clamp(min=-3.0, max=3.0)
+        #mean_x = mean_x.clamp(min=-3.0, max=3.0)
         Ks = self.spatial_kernel(s)
         Kt = self.temporal_kernel(t)
         Kc = self.covariate_kernel(c)
