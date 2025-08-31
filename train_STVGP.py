@@ -85,6 +85,7 @@ Z_spatial = inducing_df[['latitude','longitude']].values
 Z_temporal = inducing_df[['timestamp']].values
 Z_covariates = inducing_df[X_cols].astype(np.float32).values
 
+
 # Sanity checks
 for arr_name, arr in [("spatial_coords", spatial_coords), ("temporal_coords", temporal_coords),
                       ("X_covariates", X_covariates), ("Z_spatial", Z_spatial),
