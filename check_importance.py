@@ -23,7 +23,6 @@ inducing_points = torch.load('inducing_points_pois_t400r300_withamenities_parque
 
 # Define the model and likelihood classes exactly as in training
 # Define ST-VGP model
-
 class STVGPModel(gpytorch.models.ApproximateGP):
     def __init__(self, inducing_points, constant_mean):
         var_dist = gpytorch.variational.CholeskyVariationalDistribution(inducing_points.size(0))
@@ -49,7 +48,7 @@ class STVGPModel(gpytorch.models.ApproximateGP):
         s, t, c = x[:, :2], x[:, 2:3], x[:, 3:]
         # Constant mean uses covariates to determine batch shape
         mean_x = self.mean_module(c)
-        mean_x = mean_x.clamp(min=-3.0, max=3.0)
+        #mean_x = mean_x.clamp(min=-3.0, max=3.0) # No clamping
         Ks = self.spatial_kernel(s)
         Kt = self.temporal_kernel(t)
         Kc = self.covariate_kernel(c)
@@ -115,6 +114,9 @@ model.load_state_dict(torch.load('stvgp_pois_t400r300_withamenities_parquet.pth'
 likelihood.load_state_dict(torch.load('likelihood_pois_t400r300_withamenities_parquet.pth', map_location=device))
 
 
+model.eval()
+likelihood.eval()
+
 # Base covariates (fill if missing)
 base_covs = ["max", "min", "precipitation", "total_population", "white_ratio", "black_ratio", "hh_median_income"]
 for c in base_covs:
@@ -136,23 +138,78 @@ amen_feat_cols = [f"log1p_{c}" for c in amen_cols]
 X_cols = base_covs + amen_feat_cols
 
 
-# ARD-based importance over the covariate kernel
+# Prepare test features
+spatial_coords = df_test[['latitude', 'longitude']].values
+temporal_coords = df_test[['timestamp']].values
+X_covariates = df_test[X_cols].astype(np.float32).values
 
-def ard_importance_df(model, covariate_names):
-    # RBF with ARD: lengthscale shape [1, d]
-    ls = model.covariate_kernel.base_kernel.lengthscale.detach().cpu().numpy().reshape(-1)
-    rel = 1.0 / (ls**2 + 1e-12)
-    rel_norm = rel / rel.sum()
-    out = pd.DataFrame({
-        "feature": covariate_names,
-        "lengthscale": ls,
-        "rel_importance_1_over_ls2": rel,
-        "rel_importance_norm": rel_norm
-    }).sort_values("rel_importance_norm", ascending=False).reset_index(drop=True)
-    return out
+test_x_np = np.hstack((spatial_coords, temporal_coords, X_covariates))
+test_x = torch.tensor(scaler.transform(test_x_np), dtype=torch.float32).to(device)
 
-ard_df = ard_importance_df(model, X_cols)
-print("\nTop 15 by ARD (1/lengthscale^2):")
+# Check importance
+# ARD-based importance over the covariate kernel (magnitude only)
+ls = model.covariate_kernel.base_kernel.lengthscale.detach().cpu().numpy().reshape(-1)  # shape [d_cov]
+score = 1.0 / (ls**2 + 1e-12)
+ard_df = pd.DataFrame({
+    "feature": X_cols,
+    "lengthscale": ls,
+    "importance_1_over_ls2": score,
+    "importance_norm": score / score.sum()
+}).sort_values("importance_norm", ascending=False).reset_index(drop=True)
+
+print("\nTop ARD features (shorter lengthscale ⇒ stronger variation along that feature):")
 print(ard_df.head(15))
-print("\nBottom 15 by ARD (1/lengthscale^2):")
 print(ard_df.tail(15))
+
+# Gradient-based direction (sign), averaged across a sample
+# Sample a manageable subset
+rng = np.random.default_rng(0)
+N = min(20000, test_x_np.shape[0])
+idx = rng.choice(test_x_np.shape[0], size=N, replace=False)
+X_unscaled = test_x_np[idx].astype(np.float32)
+
+# Scale again (so we can track scales)
+X_scaled = scaler.transform(X_unscaled).astype(np.float32)
+
+bs = 1024
+cov_start = 3  # [lat, lon]=0:2, time=2, covariates start at 3
+grads_sum = np.zeros(len(X_cols), dtype=np.float64)
+pos_frac  = np.zeros(len(X_cols), dtype=np.float64)
+count     = 0
+
+model.eval()
+with torch.no_grad():  # we'll re-enable grad per-batch
+    pass
+
+for i in tqdm(range(0, N, bs), desc="Gradients"):
+    xb = torch.tensor(X_scaled[i:i+bs], device=device, dtype=torch.float32, requires_grad=True)
+    with torch.enable_grad():
+        post = model(xb)
+        m = post.mean  # shape [bs]
+        # total gradient of sum(m) wrt inputs
+        grad = torch.autograd.grad(outputs=m.sum(), inputs=xb, retain_graph=False, create_graph=False)[0]
+        g_cov = grad[:, cov_start:]  # keep covariate part
+        grads_sum += g_cov.detach().cpu().numpy().sum(axis=0)
+        pos_frac  += (g_cov.detach().cpu().numpy() > 0).sum(axis=0)
+        count     += g_cov.shape[0]
+
+# Average gradient in scaled space
+avg_grad_scaled = grads_sum / max(count, 1)
+
+# Convert to original units (chain rule: dx_scaled/dx = 1/std)
+stds = np.array(scaler.scale_, dtype=np.float64)[cov_start:]
+avg_grad_original_units = avg_grad_scaled / stds
+
+dir_df = pd.DataFrame({
+    "feature": X_cols,
+    "avg_grad_scaled": avg_grad_scaled,
+    "avg_grad_per_unit_in_original": avg_grad_original_units,
+    "frac_positive_grad": pos_frac / max(count, 1)
+}).sort_values("avg_grad_per_unit_in_original", ascending=False).reset_index(drop=True)
+
+print("\nGradient-based direction summary (positive values ⇒ increasing feature raises log-rate):")
+print(dir_df.head(15))
+
+# Save ard- and gradient-based direction summary
+ard_df.to_csv('data/ard_importance_summary.csv', index=False)
+dir_df.to_csv('data/gradient_based_direction_summary.csv', index=False)
