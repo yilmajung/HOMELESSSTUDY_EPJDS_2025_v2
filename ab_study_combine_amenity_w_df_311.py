@@ -4,7 +4,7 @@ from shapely.geometry import Point
 from pathlib import Path
 
 # Config
-MAIN_CSV_PATH   = "~/HOMELESSSTUDY_EPJDS_2025_v2/df_311_cleaned_20250902.csv"
+MAIN_CSV_PATH   = "~/HOMELESSSTUDY_EPJDS_2025_v2/data/df_311_cleaned_20250902.csv"
 MAIN_DATE_COL   = "timestamp"
 MAIN_GEOM_COL   = "geometry_bbox"
 MAIN_GRID_IDCOL = "bbox_id"
