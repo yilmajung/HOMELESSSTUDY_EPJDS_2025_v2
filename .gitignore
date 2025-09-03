@@ -1,3 +1,6 @@
 /data
 ST_VGP_prediction_t400r300.py
 ST_VGP_training_t400r300.py
+6_merge_cleanse_data.ipynb
+temp_311.csv
+temp_combined.csv
