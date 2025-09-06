@@ -5,3 +5,6 @@ ST_VGP_training_t400r300.py
 temp_311.csv
 temp_combined.csv
 eda.ipynb
+manuscript_data_description.ipynb
+.gitignore
+time_series_forecasting.ipynb
