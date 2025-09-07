@@ -112,30 +112,48 @@ for c in LAG_FEATS:
 
 X_cols = BASE_COVS + AMEN_FEATS + CAL_FEATS + LAG_FEATS
 
-# Train / test split for fitting models (no leakage)
-train_mask = df[DATE_COL] <= pd.Timestamp("2023-12-31")
-test_mask  = (df[DATE_COL] >= pd.Timestamp("2024-01-01")) & (df[DATE_COL] <= pd.Timestamp("2024-05-31"))
-train = df.loc[train_mask].copy()
-test  = df.loc[test_mask].copy()
+# -------------------------
+# Train / test split (time-based) with strict label filtering
+# -------------------------
+df_all = df.copy()  # keep everything (labels may be NaN)
+train_mask_time = df_all[DATE_COL] <= pd.Timestamp("2023-12-31")
+test_mask_time  = (df_all[DATE_COL] >= pd.Timestamp("2024-01-01")) & (df_all[DATE_COL] <= pd.Timestamp("2024-05-31"))
 
-# Arrays
-X_tr = train[X_cols].values.astype(float)
+# Only rows with labels for fitting/evaluating learned models
+train = df_all.loc[train_mask_time & df_all[Y_COL].notna()].copy()
+test  = df_all.loc[test_mask_time  & df_all[Y_COL].notna()].copy()
+
+def sanitize_X(mat):
+    X = np.asarray(mat, dtype=float)
+    X[~np.isfinite(X)] = 0.0
+    return X
+
+# Design matrices
+X_tr = sanitize_X(train[X_cols].values)
 y_tr = train[Y_COL].values.astype(float)
-X_all = df[X_cols].values.astype(float)
-y_all = df[Y_COL].values.astype(float)
+X_te = sanitize_X(test[X_cols].values)
+y_te = test[Y_COL].values.astype(float)
+
+# Extra checks (will raise if any issue remains)
+assert np.isfinite(y_tr).all(), "y_tr has NaNs or Infs"
+assert (y_tr >= 0).all(), "y_tr has negatives (Poisson targets must be >= 0)"
+assert np.isfinite(X_tr).all(), "X_tr has NaNs or Infs"
+
+# For predicting the entire dataset later (including unlabeled rows)
+X_all = sanitize_X(df_all[X_cols].values)
 
 # -------------------------
-# Baseline 0: Seasonal naive (lag-7)
+# Baseline 0: Seasonal naive (lag-7) — works on full df_all
 # -------------------------
 print("Predicting Seasonal Naive (lag-7)…")
-# Use the already-computed lag7 as prediction; for missing, fallback to per-grid train mean
-df["lam_seasonal7"] = df["lag7"].values
+df_all["lam_seasonal7"] = df_all["lag7"]
 grid_mean = train.groupby(ID_COL)[Y_COL].mean()
-nan_idx = df["lam_seasonal7"].isna() | np.isinf(df["lam_seasonal7"])
+
+nan_idx = df_all["lam_seasonal7"].isna() | ~np.isfinite(df_all["lam_seasonal7"])
 if nan_idx.any():
-    fill_vals = df.loc[nan_idx, ID_COL].map(grid_mean).fillna(train[Y_COL].mean())
-    df.loc[nan_idx, "lam_seasonal7"] = fill_vals.values
-df["lam_seasonal7"] = df["lam_seasonal7"].clip(lower=1e-6)
+    fill_vals = df_all.loc[nan_idx, ID_COL].map(grid_mean).fillna(train[Y_COL].mean())
+    df_all.loc[nan_idx, "lam_seasonal7"] = fill_vals.values
+df_all["lam_seasonal7"] = df_all["lam_seasonal7"].clip(lower=1e-6)
 
 # -------------------------
 # Baseline 1: Poisson GLM (L2)
@@ -143,23 +161,22 @@ df["lam_seasonal7"] = df["lam_seasonal7"].clip(lower=1e-6)
 print("Training Poisson GLM (L2)…")
 scaler = StandardScaler(with_mean=True, with_std=True)
 X_tr_sc = scaler.fit_transform(X_tr)
+X_te_sc = scaler.transform(X_te)
 X_all_sc = scaler.transform(X_all)
+
 poiss = PoissonRegressor(alpha=1.0, max_iter=300)
 poiss.fit(X_tr_sc, y_tr)
-df["lam_poisson_glm"] = poiss.predict(X_all_sc).clip(min=1e-6)
+df_all["lam_poisson_glm"] = poiss.predict(X_all_sc).clip(min=1e-6)
 
 # -------------------------
-# Baseline 2: GBM with Poisson objective (LightGBM or XGBoost)
+# Baseline 2: GBM with Poisson objective (LightGBM/XGBoost)
 # -------------------------
-def fit_predict_gbm(Xtr, ytr, Xall):
-    # Use the tail of train as validation (last 90 days) for early stopping
-    # Build a boolean mask for train val split
-    tr_idx = train.index.values
-    # last 90 days within train:
-    cutoff = train[DATE_COL].max() - pd.Timedelta(days=90)
-    valid_mask = train[DATE_COL] > cutoff
-    Xval = train.loc[valid_mask, X_cols].values.astype(float)
-    yval = train.loc[valid_mask, Y_COL].values.astype(float)
+def fit_predict_gbm(Xtr, ytr, df_train_labeled, Xall, date_col=DATE_COL, y_col=Y_COL):
+    cutoff = df_train_labeled[date_col].max() - pd.Timedelta(days=90)
+    valid = df_train_labeled.loc[df_train_labeled[date_col] > cutoff].copy()
+    # (valid is a subset of 'train', so labels are present)
+    Xval = sanitize_X(valid[X_cols].values)
+    yval = valid[y_col].values.astype(float)
 
     if HAS_LGB:
         dtrain = lgb.Dataset(Xtr, label=ytr)
@@ -216,17 +233,16 @@ def fit_predict_gbm(Xtr, ytr, Xall):
         return None, None
 
 print("Training GBM (Poisson)…")
-lam_gbm, gbm_name = fit_predict_gbm(X_tr, y_tr, X_all)
+lam_gbm, gbm_name = fit_predict_gbm(X_tr, y_tr, train, X_all)
 if gbm_name is not None:
-    df["lam_gbm"] = lam_gbm
+    df_all["lam_gbm"] = lam_gbm
 else:
     print("GBM not available — skipping.")
 
-
-# City-level Monte Carlo aggregation (per model)
-print("Aggregating city-level predictions via Monte Carlo simulation…")
+# -------------------------
+# City-level MC aggregation (unchanged), but use df_all now
+# -------------------------
 def aggregate_city_mc(df_in, lam_col, S=500, lambda_thresh=LAMBDA_THRESH):
-    # Filter by P(Y>0) >= p_thresh  <=> lambda >= lambda_thresh
     la = df_in[lam_col].values.astype(float)
     mask = la >= lambda_thresh
     df_use = df_in.loc[mask, [DATE_COL, lam_col]].copy()
@@ -234,55 +250,43 @@ def aggregate_city_mc(df_in, lam_col, S=500, lambda_thresh=LAMBDA_THRESH):
     out_rows = []
     for date, sub in df_use.groupby(DATE_COL, sort=True):
         lam = sub[lam_col].values.astype(float)
-        if lam.size == 0:
-            out_rows.append((date, 0.0, 0.0, 0.0, 0.0, 0, 0.0))
-            continue
         exp_total = lam.sum()
-        # MC simulate city total ~ sum_i Poisson(lam_i)
-        # vectorized: shape (S, n)
         sims = np.random.poisson(lam, size=(S, lam.size)).sum(axis=1)
-        mean_sim = sims.mean()
-        q05, q50, q95 = np.quantile(sims, [0.05, 0.50, 0.95])
-        out_rows.append((date, exp_total, mean_sim, q05, q95, lam.size, q50))
-    out = pd.DataFrame(out_rows, columns=["date","expected_total","sim_mean","sim_q05","sim_q95","active_boxes","sim_q50"])
-    out = out.sort_values("date").reset_index(drop=True)
-    return out
+        out_rows.append((date, exp_total, sims.mean(), *np.quantile(sims, [0.05, 0.50, 0.95]), lam.size))
+    out = pd.DataFrame(out_rows, columns=["date","expected_total","sim_mean","sim_q05","sim_q50","sim_q95","active_boxes"])
+    return out.sort_values("date").reset_index(drop=True)
 
-city_truth = df.groupby(DATE_COL, as_index=False)[Y_COL].sum().rename(columns={Y_COL: "city_truth"})
+# Ground truth for metric calc (sum over boxes) — only where labels exist
+city_truth = df_all.loc[df_all[Y_COL].notna()].groupby(DATE_COL, as_index=False)[Y_COL].sum() \
+                  .rename(columns={Y_COL: "city_truth"})
+
 results = []
-
-for model_col, model_name in [
+for col, name in [
     ("lam_seasonal7","SeasonalNaive_lag7"),
     ("lam_poisson_glm","PoissonGLM_L2"),
-    ("lam_gbm", gbm_name if gbm_name is not None else None)
+    ("lam_gbm", gbm_name if gbm_name is not None else None),
 ]:
-    if model_name is None:
-        continue
-    print(f"Aggregating city totals via MC: {model_name} …")
-    agg = aggregate_city_mc(df, model_col, S=S, lambda_thresh=LAMBDA_THRESH)
-    agg["model"] = model_name
-    # Merge ground-truth (use only dates where truth exists)
+    if name is None: continue
+    agg = aggregate_city_mc(df_all, col, S=S, lambda_thresh=LAMBDA_THRESH)
+    agg["model"] = name
     agg = agg.merge(city_truth, on="date", how="left")
     results.append(agg)
 
 city_daily = pd.concat(results, ignore_index=True).sort_values(["model","date"])
 
-# Metrics at city-level (compare sim_mean to truth over available days)
+# Metrics only on dates with truth
 summary_rows = []
-for model_name, sub in city_daily.groupby("model"):
-    eval_mask = ~sub["city_truth"].isna()
-    y_true = sub.loc[eval_mask, "city_truth"].values
-    y_hat  = sub.loc[eval_mask, "sim_mean"].values  # could also compare 'expected_total'
-    m = eval_all(y_true, y_hat)
-    summary_rows.append({"model": model_name, **m})
+for name, sub in city_daily.groupby("model"):
+    msk = sub["city_truth"].notna()
+    y_true = sub.loc[msk, "city_truth"].values
+    y_hat  = sub.loc[msk, "sim_mean"].values
+    summary_rows.append({"model": name, **eval_all(y_true, y_hat)})
 
 summary = pd.DataFrame(summary_rows).sort_values("NLPD").reset_index(drop=True)
-
-# Save outputs
-city_daily.to_csv(OUT_DAILY, index=False)
-summary.to_csv(OUT_SUMMARY, index=False)
-
-print("\n=== City-level baseline summary (lower is better for all metrics) ===")
+print("\n=== City-level baseline summary ===")
 print(summary)
 print(f"\nWrote daily city predictions to: {OUT_DAILY}")
 print(f"Wrote metric summary to: {OUT_SUMMARY}")
+
+city_daily.to_csv(OUT_DAILY, index=False)
+summary.to_csv(OUT_SUMMARY, index=False)
