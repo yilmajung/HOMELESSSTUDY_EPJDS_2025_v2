@@ -1,10 +1,10 @@
-# pip install pandas numpy geopandas scikit-learn lightgbm xgboost statsmodels pyarrow
-import os
+# pip install pandas numpy geopandas scikit-learn lightgbm xgboost pyarrow
+import os, math
 import numpy as np
 import pandas as pd
 import geopandas as gpd
 from pathlib import Path
-
+from scipy.special import gammaln
 from sklearn.preprocessing import StandardScaler
 from sklearn.linear_model import PoissonRegressor
 from sklearn.metrics import mean_squared_error
@@ -23,24 +23,25 @@ except Exception:
     HAS_XGB = False
 
 # Config
-PARQUET = "data/main_daily_with_amenities.parquet"  # adjust if needed
-ID_COL   = None  # will auto-detect "bboxid" or "grid_id"
+PARQUET = "data/main_daily_with_amenities.parquet"
 DATE_COL = "date"
 Y_COL    = "ground_truth"
+ID_COL   = "bboxid"
+OUT_DAILY = "city_daily_predictions_baselines.csv"
+OUT_SUMMARY = "baseline_city_metrics.csv"
 
-BASE_COVS = ["max","min","precipitation","total_population","white_ratio","black_ratio","hh_median_income"]
+# Monte Carlo settings (match the STVGP aggregation style)
+S = 500
+P_THRESH = 0.7
+LAMBDA_THRESH = -math.log(1.0 - P_THRESH)  # P(Y>0)=1-exp(-lambda) >= p_thresh  <=> lambda >= -log(1-p)
 
-# Helpers: metrics
-from scipy.special import gammaln
-
+# Metrics
 def mape(y_true, y_pred, eps=1e-9):
     y_true = np.asarray(y_true, dtype=float)
     y_pred = np.asarray(y_pred, dtype=float).clip(min=eps)
-    # If you truly have no zeros you can remove eps, but this is safer.
     return np.mean(np.abs((y_true - y_pred) / np.maximum(np.abs(y_true), eps))) * 100.0
 
 def mean_poisson_deviance(y, mu, eps=1e-12):
-    # 2 * [ y*log(y/mu) - (y-mu) ] with y*log(y/mu)=0 when y=0
     y = np.asarray(y, dtype=float)
     mu = np.asarray(mu, dtype=float).clip(min=eps)
     term = np.zeros_like(y)
@@ -49,10 +50,8 @@ def mean_poisson_deviance(y, mu, eps=1e-12):
     return np.mean(2.0*(term - (y - mu)))
 
 def nlpd_poisson(y, lam, eps=1e-12):
-    # Negative Log Predictive Density for Poisson
     y = np.asarray(y, dtype=float)
     lam = np.asarray(lam, dtype=float).clip(min=eps)
-    # -log P(Y=y | lam) = lam - y*log lam + log(y!)
     return np.mean(lam - y*np.log(lam) + gammaln(y+1.0))
 
 def eval_all(y_true, y_hat_mu):
@@ -63,50 +62,43 @@ def eval_all(y_true, y_hat_mu):
         "NLPD": nlpd_poisson(y_true, y_hat_mu),
     }
 
-# Load & feature engineering
+# Load & features
 gdf = gpd.read_parquet(PARQUET)
-if DATE_COL not in gdf.columns:
-    if "timestamp" in gdf.columns:
-        gdf[DATE_COL] = pd.to_datetime(gdf["timestamp"], unit="s").dt.floor("D")
+df = pd.DataFrame(gdf.drop(columns="geometry", errors="ignore"))
+
+if DATE_COL not in df.columns:
+    if "timestamp" in df.columns:
+        df[DATE_COL] = pd.to_datetime(df["timestamp"], unit="s").dt.floor("D")
     else:
         raise ValueError("No 'date' or 'timestamp' column present.")
+df[DATE_COL] = pd.to_datetime(df[DATE_COL]).dt.floor("D")
+df = df.sort_values([DATE_COL])
 
-gdf[DATE_COL] = pd.to_datetime(gdf[DATE_COL]).dt.floor("D")
-gdf = gdf.sort_values([DATE_COL])
-
-if Y_COL not in gdf.columns:
+if Y_COL not in df.columns:
     raise ValueError(f"Missing '{Y_COL}' column.")
 
-# ID (per-grid) column
-if ID_COL is None:
-    if "bboxid" in gdf.columns: ID_COL = "bboxid"
-    else:
-        raise ValueError("Couldn't find bbox id column; set ID_COL to your id field.")
+# Base covariates (ensure presence)
+BASE_COVS = ["max","min","precipitation","total_population","white_ratio","black_ratio","hh_median_income"]
+for c in BASE_COVS:
+    if c not in df.columns: df[c] = 0.0
 
-# Keep only rows with target defined for training/testing evaluation
-df = pd.DataFrame(gdf.drop(columns="geometry", errors="ignore"))
-df = df[~df[Y_COL].isna()].copy()
-
-# Amenity features: all n_* (excluding total to avoid double-count)
+# Amenity features: log1p(n_*)
 amen_cols = [c for c in df.columns if c.startswith("n_") and c != "n_amenities_total"]
 for c in amen_cols:
     df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0)
     df[f"log1p_{c}"] = np.log1p(df[c].astype(float))
-
 AMEN_FEATS = [f"log1p_{c}" for c in amen_cols]
 
-# Calendar/cyclical features
+# Calendar features
 df["dow"]  = df[DATE_COL].dt.weekday  # 0..6
 df["month"] = df[DATE_COL].dt.month   # 1..12
-# Cyclical encode (helps for linear models)
 df["dow_sin"]   = np.sin(2*np.pi*df["dow"]/7.0)
 df["dow_cos"]   = np.cos(2*np.pi*df["dow"]/7.0)
 df["month_sin"] = np.sin(2*np.pi*df["month"]/12.0)
 df["month_cos"] = np.cos(2*np.pi*df["month"]/12.0)
-
 CAL_FEATS = ["dow_sin","dow_cos","month_sin","month_cos"]
 
-# Lag features inside each grid (avoid leakage)
+# Lag features within each grid
 def add_lags(_df, id_col, y_col, lags=(7, 28)):
     _df = _df.sort_values([id_col, DATE_COL]).copy()
     for L in lags:
@@ -115,75 +107,63 @@ def add_lags(_df, id_col, y_col, lags=(7, 28)):
 
 df = add_lags(df, ID_COL, Y_COL, lags=(7, 28))
 LAG_FEATS = ["lag7","lag28"]
-
-# Replace remaining missing covariates with 0
-for c in BASE_COVS:
-    if c not in df.columns: df[c] = 0.0
 for c in LAG_FEATS:
     df[c] = df[c].fillna(0.0)
 
-# Final design
 X_cols = BASE_COVS + AMEN_FEATS + CAL_FEATS + LAG_FEATS
 
-# -------------------------
-# Train / test split (time-based)
-# Train: <= 2023-12-31, Test: 2024-01-01..2024-05-31
-# -------------------------
+# Train / test split for fitting models (no leakage)
 train_mask = df[DATE_COL] <= pd.Timestamp("2023-12-31")
 test_mask  = (df[DATE_COL] >= pd.Timestamp("2024-01-01")) & (df[DATE_COL] <= pd.Timestamp("2024-05-31"))
-
 train = df.loc[train_mask].copy()
 test  = df.loc[test_mask].copy()
 
+# Arrays
 X_tr = train[X_cols].values.astype(float)
 y_tr = train[Y_COL].values.astype(float)
-X_te = test[X_cols].values.astype(float)
-y_te = test[Y_COL].values.astype(float)
+X_all = df[X_cols].values.astype(float)
+y_all = df[Y_COL].values.astype(float)
 
 # -------------------------
-# Baseline 0: Seasonal naive (lag-7) within each grid
+# Baseline 0: Seasonal naive (lag-7)
 # -------------------------
-# Prediction: for each (id, t in test), use y_{t-7}; fallback to per-grid train mean if missing
-gkey = [ID_COL, DATE_COL]
-lag7_col = "lag7"
-
-# We already created lag7 for all rows; just take it for test
-yhat_seasonal7 = test[lag7_col].values.copy()
-# Fallbacks: per-grid mean in training
+print("Predicting Seasonal Naive (lag-7)…")
+# Use the already-computed lag7 as prediction; for missing, fallback to per-grid train mean
+df["lam_seasonal7"] = df["lag7"].values
 grid_mean = train.groupby(ID_COL)[Y_COL].mean()
-nan_idx = np.isnan(yhat_seasonal7) | np.isinf(yhat_seasonal7)
+nan_idx = df["lam_seasonal7"].isna() | np.isinf(df["lam_seasonal7"])
 if nan_idx.any():
-    # map per-grid mean
-    fill_vals = test.loc[nan_idx, ID_COL].map(grid_mean).fillna(train[Y_COL].mean())
-    yhat_seasonal7[nan_idx] = fill_vals.values
-
-metrics_seasonal7 = eval_all(y_te, yhat_seasonal7)
-print("\nBaseline — Seasonal Naive (lag-7):")
-for k,v in metrics_seasonal7.items(): print(f"  {k}: {v:.4f}")
+    fill_vals = df.loc[nan_idx, ID_COL].map(grid_mean).fillna(train[Y_COL].mean())
+    df.loc[nan_idx, "lam_seasonal7"] = fill_vals.values
+df["lam_seasonal7"] = df["lam_seasonal7"].clip(lower=1e-6)
 
 # -------------------------
 # Baseline 1: Poisson GLM (L2)
 # -------------------------
+print("Training Poisson GLM (L2)…")
 scaler = StandardScaler(with_mean=True, with_std=True)
 X_tr_sc = scaler.fit_transform(X_tr)
-X_te_sc = scaler.transform(X_te)
-
-poiss = PoissonRegressor(alpha=1.0, max_iter=200, warm_start=False)
+X_all_sc = scaler.transform(X_all)
+poiss = PoissonRegressor(alpha=1.0, max_iter=300)
 poiss.fit(X_tr_sc, y_tr)
-lam_pred_poiss = poiss.predict(X_te_sc).clip(min=1e-6)  # predicted mean (lambda)
-
-metrics_poiss = eval_all(y_te, lam_pred_poiss)
-print("\nBaseline — Poisson GLM (L2):")
-for k,v in metrics_poiss.items(): print(f"  {k}: {v:.4f}")
+df["lam_poisson_glm"] = poiss.predict(X_all_sc).clip(min=1e-6)
 
 # -------------------------
-# Baseline 2: GBM with Poisson objective
+# Baseline 2: GBM with Poisson objective (LightGBM or XGBoost)
 # -------------------------
-def fit_predict_gbm(Xtr, ytr, Xte, yte):
-    # Prefer LightGBM (faster, native Poisson); fallback to XGBoost Poisson
+def fit_predict_gbm(Xtr, ytr, Xall):
+    # Use the tail of train as validation (last 90 days) for early stopping
+    # Build a boolean mask for train val split
+    tr_idx = train.index.values
+    # last 90 days within train:
+    cutoff = train[DATE_COL].max() - pd.Timedelta(days=90)
+    valid_mask = train[DATE_COL] > cutoff
+    Xval = train.loc[valid_mask, X_cols].values.astype(float)
+    yval = train.loc[valid_mask, Y_COL].values.astype(float)
+
     if HAS_LGB:
         dtrain = lgb.Dataset(Xtr, label=ytr)
-        dvalid = lgb.Dataset(Xte, label=yte, reference=dtrain)
+        dvalid = lgb.Dataset(Xval, label=yval, reference=dtrain)
         params = dict(
             objective="poisson",
             metric="poisson",
@@ -205,11 +185,12 @@ def fit_predict_gbm(Xtr, ytr, Xte, yte):
             early_stopping_rounds=200,
             verbose_eval=False,
         )
-        lam_hat = gbm.predict(Xte, num_iteration=gbm.best_iteration)
+        lam_hat = gbm.predict(Xall, num_iteration=gbm.best_iteration)
         return lam_hat.clip(min=1e-6), "LightGBM-Poisson"
     elif HAS_XGB:
         dtrain = xgb.DMatrix(Xtr, label=ytr)
-        dvalid = xgb.DMatrix(Xte, label=yte)
+        dvalid = xgb.DMatrix(Xval, label=yval)
+        dall   = xgb.DMatrix(Xall)
         params = dict(
             objective="count:poisson",
             eval_metric="poisson-nloglik",
@@ -229,45 +210,79 @@ def fit_predict_gbm(Xtr, ytr, Xte, yte):
             early_stopping_rounds=200,
             verbose_eval=False,
         )
-        lam_hat = model.predict(dvalid, iteration_range=(0, model.best_iteration+1))
+        lam_hat = model.predict(dall, iteration_range=(0, model.best_iteration+1))
         return lam_hat.clip(min=1e-6), "XGBoost-Poisson"
     else:
-        raise RuntimeError("Neither LightGBM nor XGBoost is installed.")
+        return None, None
 
-try:
-    lam_pred_gbm, gbm_name = fit_predict_gbm(X_tr, y_tr, X_te, y_te)
-    metrics_gbm = eval_all(y_te, lam_pred_gbm)
-    print(f"\nBaseline — {gbm_name}:")
-    for k,v in metrics_gbm.items(): print(f"  {k}: {v:.4f}")
-except RuntimeError as e:
-    print(f"\nSkipped GBM baseline: {e}")
+print("Training GBM (Poisson)…")
+lam_gbm, gbm_name = fit_predict_gbm(X_tr, y_tr, X_all)
+if gbm_name is not None:
+    df["lam_gbm"] = lam_gbm
+else:
+    print("GBM not available — skipping.")
 
-# -------------------------
-# (Optional) Zero-Inflated NB (statsmodels) — skeleton
-# -------------------------
-# from statsmodels.discrete.count_model import ZeroInflatedNegativeBinomialP
-# import statsmodels.api as sm
-# exog = sm.add_constant(X_tr_sc)
-# zinb = ZeroInflatedNegativeBinomialP(endog=y_tr, exog=exog, exog_infl=exog[:, :1], inflation='logit')
-# res = zinb.fit(method='lbfgs', maxiter=200, disp=False)
-# lam_zinb = res.predict(sm.add_constant(X_te_sc), which="mean").clip(min=1e-6)
-# metrics_zinb = eval_all(y_te, lam_zinb)
-# print("\nBaseline — Zero-Inflated NB:")
-# for k,v in metrics_zinb.items(): print(f"  {k}: {v:.4f}")
 
-# -------------------------
-# Summary table
-# -------------------------
-rows = [("SeasonalNaive_lag7", metrics_seasonal7)]
-rows.append(("PoissonGLM_L2", metrics_poiss))
-if 'metrics_gbm' in locals():
-    rows.append((gbm_name, metrics_gbm))
-# if 'metrics_zinb' in locals():
-#     rows.append(("ZINB", metrics_zinb))
+# City-level Monte Carlo aggregation (per model)
+print("Aggregating city-level predictions via Monte Carlo simulation…")
+def aggregate_city_mc(df_in, lam_col, S=500, lambda_thresh=LAMBDA_THRESH):
+    # Filter by P(Y>0) >= p_thresh  <=> lambda >= lambda_thresh
+    la = df_in[lam_col].values.astype(float)
+    mask = la >= lambda_thresh
+    df_use = df_in.loc[mask, [DATE_COL, lam_col]].copy()
 
-summary = pd.DataFrame([{**{"model": name}, **m} for name, m in rows])
-print("\n=== Baseline Summary ===")
-print(summary.sort_values("NLPD").reset_index(drop=True))  # smaller NLPD is better
+    out_rows = []
+    for date, sub in df_use.groupby(DATE_COL, sort=True):
+        lam = sub[lam_col].values.astype(float)
+        if lam.size == 0:
+            out_rows.append((date, 0.0, 0.0, 0.0, 0.0, 0, 0.0))
+            continue
+        exp_total = lam.sum()
+        # MC simulate city total ~ sum_i Poisson(lam_i)
+        # vectorized: shape (S, n)
+        sims = np.random.poisson(lam, size=(S, lam.size)).sum(axis=1)
+        mean_sim = sims.mean()
+        q05, q50, q95 = np.quantile(sims, [0.05, 0.50, 0.95])
+        out_rows.append((date, exp_total, mean_sim, q05, q95, lam.size, q50))
+    out = pd.DataFrame(out_rows, columns=["date","expected_total","sim_mean","sim_q05","sim_q95","active_boxes","sim_q50"])
+    out = out.sort_values("date").reset_index(drop=True)
+    return out
 
-# Save summary to CSV for further analysis if needed
-summary.to_csv("data/baseline_summary.csv", index=False)
+city_truth = df.groupby(DATE_COL, as_index=False)[Y_COL].sum().rename(columns={Y_COL: "city_truth"})
+results = []
+
+for model_col, model_name in [
+    ("lam_seasonal7","SeasonalNaive_lag7"),
+    ("lam_poisson_glm","PoissonGLM_L2"),
+    ("lam_gbm", gbm_name if gbm_name is not None else None)
+]:
+    if model_name is None:
+        continue
+    print(f"Aggregating city totals via MC: {model_name} …")
+    agg = aggregate_city_mc(df, model_col, S=S, lambda_thresh=LAMBDA_THRESH)
+    agg["model"] = model_name
+    # Merge ground-truth (use only dates where truth exists)
+    agg = agg.merge(city_truth, on="date", how="left")
+    results.append(agg)
+
+city_daily = pd.concat(results, ignore_index=True).sort_values(["model","date"])
+
+# Metrics at city-level (compare sim_mean to truth over available days)
+summary_rows = []
+for model_name, sub in city_daily.groupby("model"):
+    eval_mask = ~sub["city_truth"].isna()
+    y_true = sub.loc[eval_mask, "city_truth"].values
+    y_hat  = sub.loc[eval_mask, "sim_mean"].values  # could also compare 'expected_total'
+    m = eval_all(y_true, y_hat)
+    summary_rows.append({"model": model_name, **m})
+
+summary = pd.DataFrame(summary_rows).sort_values("NLPD").reset_index(drop=True)
+
+# Save outputs
+city_daily.to_csv(OUT_DAILY, index=False)
+summary.to_csv(OUT_SUMMARY, index=False)
+
+print("\n=== City-level baseline summary (lower is better for all metrics) ===")
+print(summary)
+print(f"\nWrote daily city predictions to: {OUT_DAILY}")
+print(f"Wrote metric summary to: {OUT_SUMMARY}")
