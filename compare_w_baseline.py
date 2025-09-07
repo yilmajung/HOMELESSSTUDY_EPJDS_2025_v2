@@ -171,16 +171,20 @@ df_all["lam_poisson_glm"] = poiss.predict(X_all_sc).clip(min=1e-6)
 # -------------------------
 # Baseline 2: GBM with Poisson objective (LightGBM/XGBoost)
 # -------------------------
+# fallback: sklearn API
+from lightgbm import LGBMRegressor
+
 def fit_predict_gbm(Xtr, ytr, df_train_labeled, Xall, date_col=DATE_COL, y_col=Y_COL):
+    # validation = last 90 days of the labeled training window (no leakage)
     cutoff = df_train_labeled[date_col].max() - pd.Timedelta(days=90)
     valid = df_train_labeled.loc[df_train_labeled[date_col] > cutoff].copy()
-    # (valid is a subset of 'train', so labels are present)
     Xval = sanitize_X(valid[X_cols].values)
     yval = valid[y_col].values.astype(float)
 
     if HAS_LGB:
         dtrain = lgb.Dataset(Xtr, label=ytr)
         dvalid = lgb.Dataset(Xval, label=yval, reference=dtrain)
+
         params = dict(
             objective="poisson",
             metric="poisson",
@@ -191,23 +195,36 @@ def fit_predict_gbm(Xtr, ytr, df_train_labeled, Xall, date_col=DATE_COL, y_col=Y
             bagging_fraction=0.8,
             bagging_freq=1,
             lambda_l2=1.0,
-            verbose=-1,
+            # no 'verbose_eval' here; we'll control logs via callbacks
         )
+
+        # Use callbacks for early stopping (works across LGB versions)
+        callbacks = [
+            lgb.early_stopping(stopping_rounds=200, first_metric_only=True),
+            lgb.log_evaluation(period=0),  # silent; change to e.g. 50 for logs
+        ]
+
         gbm = lgb.train(
             params,
             dtrain,
             num_boost_round=5000,
             valid_sets=[dvalid],
             valid_names=["valid"],
-            early_stopping_rounds=200,
-            verbose_eval=False,
+            callbacks=callbacks,
         )
-        lam_hat = gbm.predict(Xall, num_iteration=gbm.best_iteration)
+        best_it = getattr(gbm, "best_iteration", None)
+        lam_hat = gbm.predict(Xall, num_iteration=best_it)
         return lam_hat.clip(min=1e-6), "LightGBM-Poisson"
+
     elif HAS_XGB:
         dtrain = xgb.DMatrix(Xtr, label=ytr)
+        cutoff = df_train_labeled[date_col].max() - pd.Timedelta(days=90)
+        valid = df_train_labeled.loc[df_train_labeled[date_col] > cutoff].copy()
+        Xval = sanitize_X(valid[X_cols].values)
+        yval = valid[y_col].values.astype(float)
         dvalid = xgb.DMatrix(Xval, label=yval)
         dall   = xgb.DMatrix(Xall)
+
         params = dict(
             objective="count:poisson",
             eval_metric="poisson-nloglik",
@@ -218,7 +235,7 @@ def fit_predict_gbm(Xtr, ytr, df_train_labeled, Xall, date_col=DATE_COL, y_col=Y
             lambda_=1.0,
             tree_method="hist",
         )
-        evallist = [(dvalid, 'valid')]
+        evallist = [(dvalid, "valid")]
         model = xgb.train(
             params,
             dtrain,
@@ -229,8 +246,10 @@ def fit_predict_gbm(Xtr, ytr, df_train_labeled, Xall, date_col=DATE_COL, y_col=Y
         )
         lam_hat = model.predict(dall, iteration_range=(0, model.best_iteration+1))
         return lam_hat.clip(min=1e-6), "XGBoost-Poisson"
+
     else:
         return None, None
+
 
 print("Training GBM (Poisson)…")
 lam_gbm, gbm_name = fit_predict_gbm(X_tr, y_tr, train, X_all)
