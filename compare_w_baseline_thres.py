@@ -294,7 +294,7 @@ city_truth = df_all.loc[df_all[Y_COL].notna()].groupby(DATE_COL, as_index=False)
 # ============================================================
 # Threshold sweep ONLY for GLM and Naive (not GBM)
 # ============================================================
-P_THRESH_LIST = [0.2, 0.3, 0.4, 0.5, 0.6]   # values to test
+P_THRESH_LIST = [0.6, 0.65, 0.7, 0.75]   # values to test
 
 def sweep_thresholds(df_all, models, p_list, S=500):
     """
@@ -348,8 +348,8 @@ daily_sweep, summary_sweep = sweep_thresholds(
 )
 
 # Save sweep outputs
-SWEEP_DAILY_OUT   = "city_daily_predictions_threshold_sweep.csv"
-SWEEP_SUMMARY_OUT = "baseline_city_metrics_threshold_sweep.csv"
+SWEEP_DAILY_OUT   = "city_daily_predictions_threshold_sweep2.csv"
+SWEEP_SUMMARY_OUT = "baseline_city_metrics_threshold_sweep2.csv"
 
 daily_sweep.to_csv(SWEEP_DAILY_OUT, index=False)
 summary_sweep.to_csv(SWEEP_SUMMARY_OUT, index=False)
