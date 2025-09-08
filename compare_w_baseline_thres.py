@@ -1,5 +1,16 @@
 # pip install pandas numpy geopandas scikit-learn lightgbm xgboost pyarrow
-import os, math
+import math
+import os
+# Cap all math/thread pools to avoid libgomp failures on HPCs
+os.environ["OMP_NUM_THREADS"] = "1"          # OpenMP (libgomp / llvm-openmp)
+os.environ["OPENBLAS_NUM_THREADS"] = "1"     # NumPy/OpenBLAS
+os.environ["MKL_NUM_THREADS"] = "1"          # Intel MKL (if used)
+os.environ["VECLIB_MAXIMUM_THREADS"] = "1"   # Apple Accelerate (macOS)
+os.environ["NUMEXPR_NUM_THREADS"] = "1"      # numexpr, if present
+# Optional: silence tokenizers in some envs
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
+import math
 import numpy as np
 import pandas as pd
 import geopandas as gpd
