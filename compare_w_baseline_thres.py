@@ -279,33 +279,71 @@ def aggregate_city_mc(df_in, lam_col, S=500, lambda_thresh=LAMBDA_THRESH):
 city_truth = df_all.loc[df_all[Y_COL].notna()].groupby(DATE_COL, as_index=False)[Y_COL].sum() \
                   .rename(columns={Y_COL: "city_truth"})
 
-results = []
-for col, name in [
-    ("lam_seasonal7","SeasonalNaive_lag7"),
-    ("lam_poisson_glm","PoissonGLM_L2"),
-    ("lam_gbm", gbm_name if gbm_name is not None else None),
-]:
-    if name is None: continue
-    agg = aggregate_city_mc(df_all, col, S=S, lambda_thresh=LAMBDA_THRESH)
-    agg["model"] = name
-    agg = agg.merge(city_truth, on="date", how="left")
-    results.append(agg)
 
-city_daily = pd.concat(results, ignore_index=True).sort_values(["model","date"])
+# ============================================================
+# Threshold sweep ONLY for GLM and Naive (not GBM)
+# ============================================================
+P_THRESH_LIST = [0.2, 0.3, 0.4, 0.5, 0.6]   # values to test
 
-# Metrics only on dates with truth
-summary_rows = []
-for name, sub in city_daily.groupby("model"):
-    msk = sub["city_truth"].notna()
-    y_true = sub.loc[msk, "city_truth"].values
-    y_hat  = sub.loc[msk, "sim_mean"].values
-    summary_rows.append({"model": name, **eval_all(y_true, y_hat)})
+def sweep_thresholds(df_all, models, p_list, S=500):
+    """
+    For each (model, p_thresh), aggregate city totals using MC with
+    lambda_thresh = -log(1 - p_thresh). Returns (daily_df, summary_df).
+    """
+    all_daily = []
+    all_summary = []
 
-summary = pd.DataFrame(summary_rows).sort_values("NLPD").reset_index(drop=True)
-print("\n=== City-level baseline summary ===")
-print(summary)
-print(f"\nWrote daily city predictions to: {OUT_DAILY}")
-print(f"Wrote metric summary to: {OUT_SUMMARY}")
+    # Ensure we have ground-truth city totals for metrics
+    ct = df_all.loc[df_all[Y_COL].notna()] \
+               .groupby(DATE_COL, as_index=False)[Y_COL].sum() \
+               .rename(columns={Y_COL: "city_truth"})
 
-city_daily.to_csv(OUT_DAILY, index=False)
-summary.to_csv(OUT_SUMMARY, index=False)
+    for p in p_list:
+        lam_thresh = -math.log(1.0 - p)
+        for lam_col, model_name in models:
+            # City aggregation via MC (keeps parity with your STVGP eval)
+            agg = aggregate_city_mc(df_all, lam_col, S=S, lambda_thresh=lam_thresh)
+            agg["model"] = model_name
+            agg["p_thresh"] = p
+            agg = agg.merge(ct, on="date", how="left")
+
+            # Metrics (compare sim_mean vs truth on days with labels)
+            msk = agg["city_truth"].notna()
+            y_true = agg.loc[msk, "city_truth"].values
+            y_hat  = agg.loc[msk, "sim_mean"].values
+            m = eval_all(y_true, y_hat)
+            all_summary.append({"model": model_name, "p_thresh": p, **m})
+            all_daily.append(agg)
+
+    daily_df  = pd.concat(all_daily,  ignore_index=True) \
+                  .sort_values(["model", "p_thresh", "date"])
+    summary_df = pd.DataFrame(all_summary) \
+                   .sort_values(["model", "p_thresh"]) \
+                   .reset_index(drop=True)
+    return daily_df, summary_df
+
+# Which models to evaluate in the sweep
+MODELS_TO_SWEEP = [
+    ("lam_seasonal7",   "SeasonalNaive_lag7"),
+    ("lam_poisson_glm", "PoissonGLM_L2"),
+]
+
+print("\nRunning P_THRESH sweep for Naive & GLM…")
+daily_sweep, summary_sweep = sweep_thresholds(
+    df_all=df_all,
+    models=MODELS_TO_SWEEP,
+    p_list=P_THRESH_LIST,
+    S=S,                           # reuse your MC sample size
+)
+
+# Save sweep outputs
+SWEEP_DAILY_OUT   = "city_daily_predictions_threshold_sweep.csv"
+SWEEP_SUMMARY_OUT = "baseline_city_metrics_threshold_sweep.csv"
+
+daily_sweep.to_csv(SWEEP_DAILY_OUT, index=False)
+summary_sweep.to_csv(SWEEP_SUMMARY_OUT, index=False)
+
+print("\n=== Threshold sweep summary (Naive & GLM) ===")
+print(summary_sweep)
+print(f"Wrote threshold-sweep daily predictions → {SWEEP_DAILY_OUT}")
+print(f"Wrote threshold-sweep metric summary  → {SWEEP_SUMMARY_OUT}")
