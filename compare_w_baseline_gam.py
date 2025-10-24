@@ -58,8 +58,8 @@ ID_COL   = "bboxid"             # or "grid_id" if that's what you use
 
 # Monte Carlo settings (match STVGP aggregation style)
 S = 500
-P_THRESH = 0.7
-LAMBDA_THRESH = -math.log(1.0 - P_THRESH)
+P_THRESH = range(0.2, 0.8, 0.1)
+LAMBDA_THRESH = [-math.log(1.0 - p) for p in P_THRESH]
 
 # Outputs
 OUT_DAILY   = "city_daily_predictions_baselines_4models.csv"
@@ -344,10 +344,13 @@ if gam_name is not None:
 
 results = []
 for col, name in MODEL_LIST:
-    agg = aggregate_city_mc(df_all, col, S=S, lambda_thresh=LAMBDA_THRESH)
-    agg["model"] = name
-    agg = agg.merge(city_truth, on="date", how="left")
-    results.append(agg)
+    for lambda_ in LAMBDA_THRESH:
+        print(f"Aggregating city-level predictions for {name} at lambda_thresh={lambda_:.4f}…")
+        agg = aggregate_city_mc(df_all, col, S=S, lambda_thresh=lambda_)
+        agg["model"] = name
+        agg["lambda_thresh"] = lambda_
+        agg = agg.merge(city_truth, on="date", how="left")
+        results.append(agg)
 
 city_daily = pd.concat(results, ignore_index=True).sort_values(["model","date"])
 
