@@ -58,7 +58,7 @@ ID_COL   = "bboxid"             # or "grid_id" if that's what you use
 
 # Monte Carlo settings (match STVGP aggregation style)
 S = 500
-P_THRESH = range(0.2, 0.8, 0.1)
+P_THRESH = [range(0.2, 0.8, 0.1)]
 LAMBDA_THRESH = [-math.log(1.0 - p) for p in P_THRESH]
 
 # Outputs
