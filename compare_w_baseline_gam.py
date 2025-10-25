@@ -271,6 +271,13 @@ else:
 # Baseline 4: Spatiotemporal Poisson GAM (GAM-ST)
 ##################################################
 def fit_predict_gam_st(gdf, df, date_col="date", y_col="ground_truth"):
+    """
+    Spatiotemporal Poisson GAM:
+      - Spatial smooth: te(longitude, latitude)
+      - Temporal smooth: s(t_idx)  (days since start)
+      - Weekly/monthly seasonality handled via cyclic encodings (sin/cos) as linear terms.
+      - Weather, demographics, amenities (log1p), and lags as near-linear small-spline terms.
+    """
     if not HAS_PYGAM:
         raise RuntimeError("pygam not installed. Install with: pip install pygam")
 
@@ -285,38 +292,52 @@ def fit_predict_gam_st(gdf, df, date_col="date", y_col="ground_truth"):
     t0 = pd.to_datetime(df[date_col]).min()
     df["t_idx"] = (pd.to_datetime(df[date_col]) - t0).dt.days.astype(int)
 
-    # Ensure weekly/monthly ints
-    if "dow" not in df.columns:   df["dow"] = pd.to_datetime(df[date_col]).dt.weekday
-    if "month" not in df.columns: df["month"] = pd.to_datetime(df[date_col]).dt.month
+    # Weekly/monthly encodings (use existing sin/cos if present; else create)
+    if "dow" not in df.columns:
+        df["dow"] = pd.to_datetime(df[date_col]).dt.weekday
+    if "month" not in df.columns:
+        df["month"] = pd.to_datetime(df[date_col]).dt.month
 
-    # Build GAM matrix
+    if "dow_sin" not in df.columns or "dow_cos" not in df.columns:
+        df["dow_sin"]   = np.sin(2*np.pi*df["dow"]/7.0)
+        df["dow_cos"]   = np.cos(2*np.pi*df["dow"]/7.0)
+    if "month_sin" not in df.columns or "month_cos" not in df.columns:
+        df["month_sin"] = np.sin(2*np.pi*df["month"]/12.0)
+        df["month_cos"] = np.cos(2*np.pi*df["month"]/12.0)
+
+    # Build design matrix for GAM
+    base_covs  = ["max","min","precipitation","total_population","white_ratio","black_ratio","hh_median_income"]
     amen_feats = [c for c in df.columns if c.startswith("log1p_n_")]
     lag_feats  = [c for c in df.columns if c in ("lag7","lag28")]
-    X_cols_gam = ["longitude","latitude","t_idx","dow","month"] + BASE_COVS + amen_feats + lag_feats
+    # Include cyclical sin/cos as *linear* features (no periodic= needed)
+    cyc_feats  = ["dow_sin","dow_cos","month_sin","month_cos"]
+
+    X_cols_gam = ["longitude","latitude","t_idx"] + cyc_feats + base_covs + amen_feats + lag_feats
     for c in X_cols_gam:
         df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0).astype(np.float32)
 
     train_mask = (pd.to_datetime(df[date_col]) <= pd.Timestamp("2023-12-31")) & df[y_col].notna()
-    Xtr = df.loc[train_mask, X_cols_gam].values.astype(np.float32)
-    ytr = df.loc[train_mask, y_col].values.astype(np.float32)
+    Xtr  = df.loc[train_mask, X_cols_gam].values.astype(np.float32)
+    ytr  = df.loc[train_mask, y_col].values.astype(np.float32)
     Xall = df[X_cols_gam].values.astype(np.float32)
 
-    # Terms: spatial smooth (lon,lat), time smooth, cyclic weekly/monthly
-    terms = te(0,1, n_splines=30, spline_order=3) + \
-            s(2, n_splines=20) + \
-            s(3, n_splines=6,  periodic=True) + \
-            s(4, n_splines=12, periodic=True)
+    # Terms:
+    # te(0,1): lon,lat   s(2): long-term trend
+    # The cyclical sin/cos and other covariates are linear; to allow mild flexibility,
+    # we add tiny 2-spline (order 1) terms to the remaining columns.
+    terms = te(0,1, n_splines=30, spline_order=3) + s(2, n_splines=20)
 
-    # Near-linear small-spline terms for remaining covariates
-    for j in range(5, len(X_cols_gam)):
+    # Add near-linear small-spline terms for the rest (start at col index 3)
+    for j in range(3, len(X_cols_gam)):
         terms += s(j, n_splines=2, spline_order=1)
 
     gam = PoissonGAM(terms, fit_intercept=True)
-    lams = np.logspace(-2, 3, 6)   # quick smoothing search
+    lams = np.logspace(-2, 3, 6)   # quick smoothing grid
     gam = gam.gridsearch(Xtr, ytr, lam=lams, progress=False)
 
     lam_hat = np.clip(gam.predict_mu(Xall), 1e-6, None)
     return lam_hat, "GAM_ST"
+
 
 print("Training Spatiotemporal Poisson GAM (GAM-ST)…")
 try:
