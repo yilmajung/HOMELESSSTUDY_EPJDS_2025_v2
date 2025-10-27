@@ -27,6 +27,7 @@ from scipy.special import gammaln
 from sklearn.preprocessing import StandardScaler
 from sklearn.linear_model import PoissonRegressor
 from sklearn.metrics import mean_squared_error
+from scipy.special import gammaln
 
 # Optional GBMs
 try:
@@ -186,6 +187,28 @@ X_all = sanitize_X(df_all[X_cols].values)
 assert np.isfinite(y_tr).all(), "y_tr has NaNs or Infs"
 assert (y_tr >= 0).all(), "y_tr has negatives (Poisson targets must be >= 0)"
 assert np.isfinite(X_tr).all(), "X_tr has NaNs or Infs"
+
+# Load ground-truth sf data
+df_sf = pd.read_csv('/Users/wooyongjung/WJ_Projects/HomelessStudy_SanFrancisco_2025_rev/data/sf_tent.csv')
+
+# Drop rows with NaN in 'date' column
+df_sf = df_sf.dropna(subset=['date'], axis=0)
+
+# Create timestamp column in df_sf using year, month, and day
+df_sf.rename(columns={'date': 'day'}, inplace=True)
+df_sf['timestamp'] = pd.to_datetime(df_sf[['year', 'month', 'day']])
+
+# Ensure we have a 'timestamp' (datetime) column aligned with df_sf
+if 'timestamp' not in df_all.columns:
+    df_all['timestamp'] = pd.to_datetime(df_all[DATE_COL])
+else:
+    df_all['timestamp'] = pd.to_datetime(df_all['timestamp'])
+
+
+# Basic settings
+S = 500
+z95 = 1.96
+EPS = 1e-12
 
 ####################################
 # Baseline 1: Seasonal naive (lag-7)
@@ -347,48 +370,202 @@ except Exception as e:
     print(f"GAM-ST skipped: {e}")
     gam_name = None
 
-#####################################################
-# City-level MC aggregation for all models + metrics
-#####################################################
-city_truth = (df_all.loc[df_all[Y_COL].notna()]
-                .groupby(DATE_COL, as_index=False)[Y_COL].sum()
-                .rename(columns={Y_COL: "city_truth"}))
+##############################################
+# City-level MC aggregation in STVGP style
+##############################################
 
-MODEL_LIST = [
+def mean_poisson_deviance(y, mu, eps=EPS):
+    y  = np.asarray(y, dtype=float)
+    mu = np.asarray(mu, dtype=float)
+    return 2.0 * np.mean(y * (np.log((y + eps) / (mu + eps))) - (y - mu))
+
+def log_pois_pmf(k, lam, eps=EPS):
+    return k*np.log(lam + eps) - lam - gammaln(k + 1.0)
+
+def day_log_predictive(k, lambda_draws):
+    lp = log_pois_pmf(k, lambda_draws)
+    m  = np.max(lp)
+    return m + np.log(np.mean(np.exp(lp - m) + 0.0))
+
+def stvgp_style_city_eval(df_cells, lam_col, df_sf, p_thresh):
+    """
+    df_cells: per-cell dataframe with columns [timestamp, <lam_col>]
+    lam_col : column with per-cell mean λ̂
+    p_thresh: threshold on P(Y>0) = 1 - exp(-median)
+    Returns: (df_daily, metrics_dict, lambda_draws_by_day)
+    """
+    df_combined = df_cells[['timestamp', lam_col]].copy()
+    df_combined = df_combined.rename(columns={lam_col: 'median'})  # use λ̂ as 'median'
+    # no process uncertainty for baselines → set lower95 = median (σ=0)
+    df_combined['lower95'] = df_combined['median']
+
+    daily_out  = []
+    lambda_draws_by_day = {}
+    n_days = df_combined['timestamp'].nunique()
+
+    for day, grp in df_combined.groupby('timestamp', sort=True):
+        med = grp['median'].values.astype(float)
+        l95 = grp['lower95'].values.astype(float)
+
+        # P(Y_i>0) = 1 - exp(-median)
+        p_any = 1.0 - np.exp(-med)
+        keep_mask = p_any >= p_thresh
+
+        if not keep_mask.any():
+            daily_out.append({
+                'timestamp':  day,
+                'mean_total': 0.0,
+                'median_total': 0.0,
+                'lower95': 0.0,
+                'upper95': 0.0,
+                'lower90': 0.0,
+                'upper90': 0.0,
+                'active_boxes': 0,
+            })
+            # also store degenerate Λ draws (=0)
+            lambda_draws_by_day[day] = np.zeros(S, dtype=float)
+            continue
+
+        med_filt = med[keep_mask]
+        l95_filt = l95[keep_mask]
+        nbox     = med_filt.size
+
+        # Reconstruct Normal(f) params from (median, l95)
+        # For baselines: l95 == median → sigma = 0 → degenerate
+        mu_f    = np.log(np.maximum(med_filt, EPS))
+        sigma_f = (np.log(np.maximum(med_filt, EPS)) - np.log(np.maximum(l95_filt, EPS))) / z95
+        sigma_f = np.clip(sigma_f, 0.0, None)
+
+        # Monte Carlo draws of log-rate f, then λ = exp(f)
+        f_samps = np.random.normal(loc=mu_f[None, :], scale=sigma_f[None, :], size=(S, nbox))
+        lam_samps = np.exp(f_samps)
+        lam_samps = np.minimum(lam_samps, 1e3)  # same optional cap
+
+        # Poisson sampling of counts per box, sum to city
+        y_samps    = np.random.poisson(lam_samps)
+        city_samps = y_samps.sum(axis=1)
+
+        # Store Λ_s (sum of λ_s across boxes) for mixture-of-Poissons NLPD
+        lambda_draws_by_day[day] = lam_samps.sum(axis=1)
+
+        daily_out.append({
+            'timestamp':   day,
+            'mean_total':  city_samps.mean(),
+            'median_total': np.median(city_samps),
+            'lower95':     np.percentile(city_samps, 2.5),
+            'upper95':     np.percentile(city_samps, 97.5),
+            'lower90':     np.percentile(city_samps, 5.0),
+            'upper90':     np.percentile(city_samps, 95.0),
+            'active_boxes': int(nbox),
+        })
+
+    df_daily = pd.DataFrame(daily_out).sort_values('timestamp').reset_index(drop=True)
+
+    # Align with ground-truth df_sf (your exact filter)
+    df_eval = (
+        df_sf[df_sf['timestamp'] < '2024-06-01'][['timestamp','tents']]
+          .merge(df_daily[['timestamp','mean_total']], on='timestamp', how='inner')
+          .rename(columns={'tents':'y','mean_total':'yhat'})
+          .sort_values('timestamp')
+          .reset_index(drop=True)
+    )
+    y    = df_eval['y'].to_numpy(dtype=float)
+    yhat = df_eval['yhat'].to_numpy(dtype=float)
+
+    rmse = float(np.sqrt(np.mean((yhat - y)**2)))
+    mape = float(np.mean(np.abs(yhat - y) / (y + EPS)) * 100.0)
+    mpd  = float(mean_poisson_deviance(y, yhat))
+
+    # Mixture-of-Poissons NLPD
+    logps = []
+    for ts, k in zip(df_eval['timestamp'].tolist(), y.astype(int)):
+        lam_draws = lambda_draws_by_day.get(ts, None)
+        if lam_draws is None or len(lam_draws) == 0:
+            lam_draws = np.array([df_eval.loc[df_eval['timestamp']==ts, 'yhat'].item()], dtype=float)
+        logps.append(day_log_predictive(k, lam_draws))
+    nlpd = float(-np.mean(logps))
+
+    metrics = {"RMSE": rmse, "MAPE(%)": mape, "MeanPoissonDev": mpd, "NLPD": nlpd}
+    return df_daily, metrics, lambda_draws_by_day
+
+# -------- run for multiple thresholds and models you care about --------
+P_LIST = [0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8]   # thresholds to test
+MODELS_FOR_SWEEP = [
     ("lam_seasonal7",   "SeasonalNaive_lag7"),
     ("lam_poisson_glm", "PoissonGLM_L2"),
+    ("lam_gbm",         gbm_name)       if "lam_gbm" in df_all else None,
+    ("lam_gam_st",      "GAM_ST")       if "lam_gam_st" in df_all else None,
 ]
-if gbm_name is not None:
-    MODEL_LIST.append(("lam_gbm", gbm_name))
-if gam_name is not None:
-    MODEL_LIST.append(("lam_gam_st", gam_name))
+MODELS_FOR_SWEEP = [m for m in MODELS_FOR_SWEEP if m is not None]
 
-results = []
-for col, name in MODEL_LIST:
-    for lambda_ in LAMBDA_THRESH:
-        print(f"Aggregating city-level predictions for {name} at lambda_thresh={lambda_:.4f}…")
-        agg = aggregate_city_mc(df_all, col, S=S, lambda_thresh=lambda_)
-        agg["model"] = name
-        agg["lambda_thresh"] = lambda_
-        agg = agg.merge(city_truth, on="date", how="left")
-        results.append(agg)
+all_daily, all_summary = [], []
+for lam_col, model_name in MODELS_FOR_SWEEP:
+    for p in P_LIST:
+        daily_df, metrics, _ = stvgp_style_city_eval(df_all[['timestamp', lam_col]].copy(),
+                                                     lam_col=lam_col, df_sf=df_sf, p_thresh=p)
+        daily_df["model"] = model_name
+        daily_df["p_thresh"] = p
+        all_daily.append(daily_df)
 
-city_daily = pd.concat(results, ignore_index=True).sort_values(["model","date"])
+        row = {"model": model_name, "p_thresh": p, **metrics}
+        all_summary.append(row)
 
-# Metrics only on dates with ground-truth
-summary_rows = []
-for name, sub in city_daily.groupby("model"):
-    msk = sub["city_truth"].notna()
-    y_true = sub.loc[msk, "city_truth"].values
-    y_hat  = sub.loc[msk, "sim_mean"].values
-    summary_rows.append({"model": name, **eval_all(y_true, y_hat)})
+df_daily_sweep  = pd.concat(all_daily, ignore_index=True).sort_values(["model","p_thresh","timestamp"])
+df_summary_sweep = pd.DataFrame(all_summary).sort_values(["model","p_thresh"]).reset_index(drop=True)
 
-summary = pd.DataFrame(summary_rows).sort_values("NLPD").reset_index(drop=True)
-print("\n=== City-level baseline summary (4 models) ===")
-print(summary)
+print("\n=== STVGP-style threshold sweep summary (Naive & GLM) ===")
+print(df_summary_sweep.head(20))
 
-# Save outputs
-city_daily.to_csv(OUT_DAILY, index=False)
-summary.to_csv(OUT_SUMMARY, index=False)
-print(f"\nWrote daily city predictions → {OUT_DAILY}")
-print(f"Wrote metric summary        → {OUT_SUMMARY}")
+# Optional: save
+df_daily_sweep.to_csv("city_daily_predictions_threshold_sweep_stvgpstyle.csv", index=False)
+df_summary_sweep.to_csv("baseline_city_metrics_threshold_sweep_stvgpstyle.csv", index=False)
+
+
+
+
+
+# #####################################################
+# # City-level MC aggregation for all models + metrics
+# #####################################################
+# city_truth = (df_all.loc[df_all[Y_COL].notna()]
+#                 .groupby(DATE_COL, as_index=False)[Y_COL].sum()
+#                 .rename(columns={Y_COL: "city_truth"}))
+
+# MODEL_LIST = [
+#     ("lam_seasonal7",   "SeasonalNaive_lag7"),
+#     ("lam_poisson_glm", "PoissonGLM_L2"),
+# ]
+# if gbm_name is not None:
+#     MODEL_LIST.append(("lam_gbm", gbm_name))
+# if gam_name is not None:
+#     MODEL_LIST.append(("lam_gam_st", gam_name))
+
+# results = []
+# for col, name in MODEL_LIST:
+#     for lambda_ in LAMBDA_THRESH:
+#         print(f"Aggregating city-level predictions for {name} at lambda_thresh={lambda_:.4f}…")
+#         agg = aggregate_city_mc(df_all, col, S=S, lambda_thresh=lambda_)
+#         agg["model"] = name
+#         agg["lambda_thresh"] = lambda_
+#         agg = agg.merge(city_truth, on="date", how="left")
+#         results.append(agg)
+
+# city_daily = pd.concat(results, ignore_index=True).sort_values(["model","date"])
+
+# # Metrics only on dates with ground-truth
+# summary_rows = []
+# for name, sub in city_daily.groupby("model"):
+#     msk = sub["city_truth"].notna()
+#     y_true = sub.loc[msk, "city_truth"].values
+#     y_hat  = sub.loc[msk, "sim_mean"].values
+#     summary_rows.append({"model": name, **eval_all(y_true, y_hat)})
+
+# summary = pd.DataFrame(summary_rows).sort_values("NLPD").reset_index(drop=True)
+# print("\n=== City-level baseline summary (4 models) ===")
+# print(summary)
+
+# # Save outputs
+# city_daily.to_csv(OUT_DAILY, index=False)
+# summary.to_csv(OUT_SUMMARY, index=False)
+# print(f"\nWrote daily city predictions → {OUT_DAILY}")
+# print(f"Wrote metric summary        → {OUT_SUMMARY}")
