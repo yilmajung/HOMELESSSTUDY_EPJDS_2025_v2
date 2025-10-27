@@ -189,7 +189,7 @@ assert (y_tr >= 0).all(), "y_tr has negatives (Poisson targets must be >= 0)"
 assert np.isfinite(X_tr).all(), "X_tr has NaNs or Infs"
 
 # Load ground-truth sf data
-df_sf = pd.read_csv('/Users/wooyongjung/WJ_Projects/HomelessStudy_SanFrancisco_2025_rev/data/sf_tent.csv')
+df_sf = pd.read_csv('sf_tent.csv')
 
 # Drop rows with NaN in 'date' column
 df_sf = df_sf.dropna(subset=['date'], axis=0)
