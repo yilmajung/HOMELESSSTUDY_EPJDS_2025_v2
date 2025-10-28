@@ -59,12 +59,12 @@ ID_COL   = "bboxid"             # or "grid_id" if that's what you use
 
 # Monte Carlo settings (match STVGP aggregation style)
 S = 500
-P_THRESH = [0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8]
+P_THRESH = np.arange(0.3, 0.92, 0.02).tolist() # thresholds to test
 LAMBDA_THRESH = [-math.log(1.0 - p) for p in P_THRESH]
 
 # Outputs
-OUT_DAILY   = "city_daily_predictions_baselines_4models.csv"
-OUT_SUMMARY = "baseline_city_metrics_4models.csv"
+# OUT_DAILY   = "city_daily_predictions_baselines_4models.csv"
+# OUT_SUMMARY = "baseline_city_metrics_4models.csv"
 
 # Base covariates list
 BASE_COVS = ["max","min","precipitation","total_population","white_ratio","black_ratio","hh_median_income"]

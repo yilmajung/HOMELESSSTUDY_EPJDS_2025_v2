@@ -210,6 +210,86 @@ S = 500
 z95 = 1.96
 EPS = 1e-12
 
+####################################
+# Baseline 1: Seasonal naive (lag-7)
+####################################
+print("Predicting Seasonal Naive (lag-7)…")
+df_all["lam_seasonal7"] = df_all["lag7"]
+grid_mean = train.groupby(ID_COL)[Y_COL].mean()
+nan_idx = df_all["lam_seasonal7"].isna() | ~np.isfinite(df_all["lam_seasonal7"])
+if nan_idx.any():
+    fill_vals = df_all.loc[nan_idx, ID_COL].map(grid_mean).fillna(train[Y_COL].mean())
+    df_all.loc[nan_idx, "lam_seasonal7"] = fill_vals.values
+df_all["lam_seasonal7"] = df_all["lam_seasonal7"].clip(lower=1e-6)
+
+###############################
+# Baseline 2: Poisson GLM (L2)
+###############################
+print("Training Poisson GLM (L2)…")
+scaler = StandardScaler(with_mean=True, with_std=True)
+X_tr_sc  = scaler.fit_transform(X_tr)
+X_all_sc = scaler.transform(X_all)
+from threadpoolctl import threadpool_limits
+with threadpool_limits(limits=1):  # extra safety for MKL/OpenBLAS threads
+    poiss = PoissonRegressor(alpha=1.0, max_iter=300)
+    poiss.fit(X_tr_sc, y_tr)
+df_all["lam_poisson_glm"] = poiss.predict(X_all_sc).clip(min=1e-6)
+
+# #######################################################
+# Baseline 3: GBM (LightGBM preferred; XGBoost fallback)
+# #######################################################
+def fit_predict_gbm(Xtr, ytr, df_train_labeled, Xall):
+    cutoff = df_train_labeled[DATE_COL].max() - pd.Timedelta(days=90)
+    valid  = df_train_labeled.loc[df_train_labeled[DATE_COL] > cutoff].copy()
+    Xval   = sanitize_X(valid[X_cols].values)
+    yval   = valid[Y_COL].values.astype(float)
+
+    if HAS_LGB:
+        try:
+            dtrain = lgb.Dataset(Xtr, label=ytr)
+            dvalid = lgb.Dataset(Xval, label=yval, reference=dtrain)
+            params = dict(
+                objective="poisson", metric="poisson",
+                learning_rate=0.05, num_leaves=63,
+                min_data_in_leaf=50, feature_fraction=0.8,
+                bagging_fraction=0.8, bagging_freq=1,
+                lambda_l2=1.0, num_threads=1,   # cap threads
+            )
+            callbacks = [lgb.early_stopping(200, first_metric_only=True),
+                         lgb.log_evaluation(period=0)]
+            gbm = lgb.train(params, dtrain, num_boost_round=5000,
+                            valid_sets=[dvalid], valid_names=["valid"],
+                            callbacks=callbacks)
+            best_it = getattr(gbm, "best_iteration", None)
+            lam_hat = gbm.predict(Xall, num_iteration=best_it)
+            return lam_hat.clip(min=1e-6), "LightGBM-Poisson"
+        except Exception as e:
+            print(f"[LightGBM] fallback to XGBoost: {e}")
+
+    if HAS_XGB:
+        dtrain = xgb.DMatrix(Xtr, label=ytr)
+        dvalid = xgb.DMatrix(Xval, label=yval)
+        dall   = xgb.DMatrix(Xall)
+        params = dict(
+            objective="count:poisson", eval_metric="poisson-nloglik",
+            eta=0.05, max_depth=8, subsample=0.8, colsample_bytree=0.8,
+            lambda_=1.0, tree_method="hist", nthread=1,   # cap threads
+        )
+        model = xgb.train(params, dtrain, num_boost_round=5000,
+                          evals=[(dvalid, "valid")],
+                          early_stopping_rounds=200, verbose_eval=False)
+        lam_hat = model.predict(dall, iteration_range=(0, model.best_iteration+1))
+        return lam_hat.clip(min=1e-6), "XGBoost-Poisson"
+
+    return None, None
+
+print("Training GBM (Poisson)…")
+lam_gbm, gbm_name = fit_predict_gbm(X_tr, y_tr, train, X_all)
+if gbm_name is not None:
+    df_all["lam_gbm"] = lam_gbm
+else:
+    print("GBM not available — skipping.")
+
 
 ##################################################
 # Baseline 4: Spatiotemporal Poisson GAM (GAM-ST)
