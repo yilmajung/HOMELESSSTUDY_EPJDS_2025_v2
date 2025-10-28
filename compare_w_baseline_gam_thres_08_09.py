@@ -59,7 +59,7 @@ ID_COL   = "bboxid"             # or "grid_id" if that's what you use
 
 # Monte Carlo settings (match STVGP aggregation style)
 S = 500
-P_THRESH = [0.7, 0.72, 0.74, 0.76, 0.78]
+P_THRESH = np.arange(0.3, 0.92, 0.02).tolist() # thresholds to test
 LAMBDA_THRESH = [-math.log(1.0 - p) for p in P_THRESH]
 
 # Outputs
@@ -410,11 +410,12 @@ def stvgp_style_city_eval(df_cells, lam_col, df_sf, p_thresh):
     return df_daily, metrics, lambda_draws_by_day
 
 # -------- run for multiple thresholds and models you care about --------
-P_LIST = [0.7, 0.72, 0.74, 0.76, 0.78]   # thresholds to test
+# Create a P_LIST from 0.2 to 0.9 with step 0.02
+P_LIST = np.arange(0.3, 0.92, 0.02).tolist() # thresholds to test
 MODELS_FOR_SWEEP = [
-    # ("lam_seasonal7",   "SeasonalNaive_lag7"),
-    # ("lam_poisson_glm", "PoissonGLM_L2"),
-    # ("lam_gbm",         gbm_name)       if "lam_gbm" in df_all else None,
+    ("lam_seasonal7",   "SeasonalNaive_lag7"),
+    ("lam_poisson_glm", "PoissonGLM_L2"),
+    ("lam_gbm",         gbm_name)       if "lam_gbm" in df_all else None,
     ("lam_gam_st",      "GAM_ST")       if "lam_gam_st" in df_all else None,
 ]
 MODELS_FOR_SWEEP = [m for m in MODELS_FOR_SWEEP if m is not None]
@@ -438,5 +439,5 @@ print("\n=== STVGP-style threshold sweep summary ===")
 print(df_summary_sweep.head(20))
 
 # Optional: save
-df_daily_sweep.to_csv("gam_only2_city_daily_predictions_threshold_sweep_stvgpstyle.csv", index=False)
-df_summary_sweep.to_csv("gam_only2_baseline_city_metrics_threshold_sweep_stvgpstyle.csv", index=False)
+df_daily_sweep.to_csv("gam_final_city_daily_predictions_threshold_sweep_stvgpstyle.csv", index=False)
+df_summary_sweep.to_csv("gam_final_city_metrics_threshold_sweep_stvgpstyle.csv", index=False)
