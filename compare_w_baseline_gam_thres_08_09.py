@@ -464,9 +464,9 @@ def stvgp_style_city_eval(df_cells, lam_col, df_sf, p_thresh):
 
     # Align with ground-truth df_sf (your exact filter)
     df_eval = (
-        df_sf[df_sf['timestamp'] < '2024-06-01'][['timestamp','tents']]
+        df_sf[df_sf['timestamp'] < '2024-01-01'][['timestamp','tent_struc']]
           .merge(df_daily[['timestamp','mean_total']], on='timestamp', how='inner')
-          .rename(columns={'tents':'y','mean_total':'yhat'})
+          .rename(columns={'tent_struc':'y','mean_total':'yhat'})
           .sort_values('timestamp')
           .reset_index(drop=True)
     )
