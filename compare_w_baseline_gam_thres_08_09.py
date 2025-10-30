@@ -235,6 +235,94 @@ with threadpool_limits(limits=1):  # extra safety for MKL/OpenBLAS threads
     poiss.fit(X_tr_sc, y_tr)
 df_all["lam_poisson_glm"] = poiss.predict(X_all_sc).clip(min=1e-6)
 
+
+# ================================
+# Baseline 2b: Negative Binomial & Zero-Inflated models (statsmodels)
+# ================================
+print("Training NB / ZIP baselines…")
+from threadpoolctl import threadpool_limits
+
+# statsmodels imports
+import statsmodels.api as sm
+from statsmodels.discrete.count_model import ZeroInflatedPoisson, ZeroInflatedNegativeBinomialP
+
+# Ensure integer counts for SM discrete models
+y_tr_int = np.asarray(y_tr, dtype=np.int64)
+
+# Add intercept (statsmodels needs explicit constant)
+X_tr_sm  = sm.add_constant(X_tr_sc, has_constant='add')
+X_all_sm = sm.add_constant(X_all_sc, has_constant='add')
+
+lam_nb = None
+lam_zip = None
+lam_zinb = None
+
+# ---- NB (discrete NB2; estimates dispersion) ----
+try:
+    with threadpool_limits(limits=1):
+        nb_mod = sm.NegativeBinomial(endog=y_tr_int, exog=X_tr_sm, loglike_method='nb2')  # NB2 variance
+        nb_fit = nb_mod.fit(method='lbfgs', disp=False, maxiter=300)
+    lam_nb = np.clip(nb_fit.predict(X_all_sm), 1e-6, None)
+    df_all["lam_nb"] = lam_nb
+    print(" NB baseline trained.")
+except Exception as e:
+    print(f" NB baseline failed: {e}")
+
+# ---- ZIP (zero-inflated Poisson with logit inflation) ----
+# Inflation design: keep it simple & stable → use just a constant and lag7 (if present)
+infl_cols = []
+if "lag7" in df_all.columns:
+    # IMPORTANT: use the **scaled** version for stability; we can reuse GLM scaling
+    # Build an inflation array aligned to X_all_sc:
+    # we don't have a scaler per-column names, so directly create an array:
+    # constant + standardized lag7
+    # Pull raw lag7 then z-score on train
+    lag7_tr = train["lag7"].to_numpy(dtype=float)
+    lag7_all = df_all["lag7"].to_numpy(dtype=float)
+    lag7_mu, lag7_sd = lag7_tr.mean(), lag7_tr.std() if lag7_tr.std() > 0 else 1.0
+    infl_tr = (lag7_tr - lag7_mu) / lag7_sd
+    infl_all = (lag7_all - lag7_mu) / lag7_sd
+
+    infl_exog_tr  = np.column_stack([np.ones_like(infl_tr), infl_tr]).astype(np.float32)
+    infl_exog_all = np.column_stack([np.ones_like(infl_all), infl_all]).astype(np.float32)
+else:
+    infl_exog_tr  = np.ones((len(y_tr_int), 1), dtype=np.float32)   # constant-only inflation
+    infl_exog_all = np.ones((len(df_all), 1), dtype=np.float32)
+
+try:
+    with threadpool_limits(limits=1):
+        zip_mod = ZeroInflatedPoisson(
+            endog=y_tr_int,
+            exog=X_tr_sm,
+            exog_infl=infl_exog_tr,
+            inflation='logit'
+        )
+        zip_fit = zip_mod.fit(method='lbfgs', disp=False, maxiter=300)
+    lam_zip = np.clip(zip_fit.predict(exog=X_all_sm, exog_infl=infl_exog_all, which='mean'), 1e-6, None)
+    df_all["lam_zip"] = lam_zip
+    print(" ZIP baseline trained.")
+except Exception as e:
+    print(f" ZIP baseline failed: {e}")
+
+# ---- ZINB (optional; more flexible than ZIP if data is strongly overdispersed) ----
+try:
+    with threadpool_limits(limits=1):
+        zinb_mod = ZeroInflatedNegativeBinomialP(
+            endog=y_tr_int,
+            exog=X_tr_sm,
+            exog_infl=infl_exog_tr,
+            inflation='logit'
+        )
+        zinb_fit = zinb_mod.fit(method='lbfgs', disp=False, maxiter=300)
+    lam_zinb = np.clip(zinb_fit.predict(exog=X_all_sm, exog_infl=infl_exog_all, which='mean'), 1e-6, None)
+    df_all["lam_zinb"] = lam_zinb
+    print(" ZINB baseline trained.")
+except Exception as e:
+    print(f" ZINB baseline failed: {e}")
+
+
+
+
 # #######################################################
 # Baseline 3: GBM (LightGBM preferred; XGBoost fallback)
 # #######################################################
@@ -492,13 +580,18 @@ def stvgp_style_city_eval(df_cells, lam_col, df_sf, p_thresh):
 # -------- run for multiple thresholds and models you care about --------
 # Create a P_LIST from 0.2 to 0.9 with step 0.02
 P_LIST = np.arange(0.3, 0.92, 0.02).tolist() # thresholds to test
+
 MODELS_FOR_SWEEP = [
     ("lam_seasonal7",   "SeasonalNaive_lag7"),
     ("lam_poisson_glm", "PoissonGLM_L2"),
     ("lam_gbm",         gbm_name)       if "lam_gbm" in df_all else None,
     ("lam_gam_st",      "GAM_ST")       if "lam_gam_st" in df_all else None,
+    ("lam_nb",          "NB2_discrete") if "lam_nb" in df_all else None,
+    ("lam_zip",         "ZIP_logit")    if "lam_zip" in df_all else None,
+    ("lam_zinb",        "ZINB_logit")   if "lam_zinb" in df_all else None,
 ]
 MODELS_FOR_SWEEP = [m for m in MODELS_FOR_SWEEP if m is not None]
+
 
 all_daily, all_summary = [], []
 for lam_col, model_name in MODELS_FOR_SWEEP:
@@ -519,5 +612,5 @@ print("\n=== STVGP-style threshold sweep summary ===")
 print(df_summary_sweep.head(20))
 
 # Optional: save
-df_daily_sweep.to_csv("gam_final_city_daily_predictions_threshold_sweep_stvgpstyle.csv", index=False)
-df_summary_sweep.to_csv("gam_final_city_metrics_threshold_sweep_stvgpstyle.csv", index=False)
+df_daily_sweep.to_csv("gam_final2_city_daily_predictions_threshold_sweep_stvgpstyle.csv", index=False)
+df_summary_sweep.to_csv("gam_final2_city_metrics_threshold_sweep_stvgpstyle.csv", index=False)
