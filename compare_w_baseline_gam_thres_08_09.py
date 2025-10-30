@@ -590,13 +590,13 @@ def stvgp_style_city_eval(df_cells, lam_col, df_sf, p_thresh):
 P_LIST = np.arange(0.3, 0.92, 0.02).tolist() # thresholds to test
 
 MODELS_FOR_SWEEP = [
-    ("lam_seasonal7",   "SeasonalNaive_lag7"),
-    ("lam_poisson_glm", "PoissonGLM_L2"),
-    ("lam_gbm",         gbm_name)       if "lam_gbm" in df_all else None,
+    # ("lam_seasonal7",   "SeasonalNaive_lag7"),
+    # ("lam_poisson_glm", "PoissonGLM_L2"),
+    # ("lam_gbm",         gbm_name)       if "lam_gbm" in df_all else None,
     ("lam_gam_st",      "GAM_ST")       if "lam_gam_st" in df_all else None,
-    ("lam_nb",          "NB2_discrete") if "lam_nb" in df_all else None,
-    ("lam_zip",         "ZIP_logit")    if "lam_zip" in df_all else None,
-    ("lam_zinb",        "ZINB_logit")   if "lam_zinb" in df_all else None,
+    # ("lam_nb",          "NB2_discrete") if "lam_nb" in df_all else None,
+    # ("lam_zip",         "ZIP_logit")    if "lam_zip" in df_all else None,
+    # ("lam_zinb",        "ZINB_logit")   if "lam_zinb" in df_all else None,
 ]
 MODELS_FOR_SWEEP = [m for m in MODELS_FOR_SWEEP if m is not None]
 
@@ -620,5 +620,5 @@ print("\n=== STVGP-style threshold sweep summary ===")
 print(df_summary_sweep.head(20))
 
 # Optional: save
-df_daily_sweep.to_csv("gam_final2_city_daily_predictions_threshold_sweep_stvgpstyle.csv", index=False)
-df_summary_sweep.to_csv("gam_final2_city_metrics_threshold_sweep_stvgpstyle.csv", index=False)
+df_daily_sweep.to_csv("gam_only3_city_daily_predictions_threshold_sweep_stvgpstyle.csv", index=False)
+df_summary_sweep.to_csv("gam_only3_city_metrics_threshold_sweep_stvgpstyle.csv", index=False)
