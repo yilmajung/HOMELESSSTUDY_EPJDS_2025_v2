@@ -387,9 +387,14 @@ from pygam import PoissonGAM, s, te
 from sklearn.model_selection import TimeSeriesSplit
 from sklearn.preprocessing import StandardScaler
 
+from pygam import PoissonGAM, s, te
+from sklearn.model_selection import TimeSeriesSplit
+from sklearn.preprocessing import StandardScaler
+
 def fit_predict_gam_st_robust(gdf, df, date_col="date", y_col="ground_truth",
-                              use_pseudo_grid_re=False):
+                              use_pseudo_grid_re=False, n_splits=5):
     df = df.copy()
+
     # Ensure lon/lat
     if not {"latitude","longitude"}.issubset(df.columns):
         cent = gdf.geometry.centroid
@@ -400,16 +405,13 @@ def fit_predict_gam_st_robust(gdf, df, date_col="date", y_col="ground_truth",
     t0 = pd.to_datetime(df[date_col]).min()
     df["t_idx"] = (pd.to_datetime(df[date_col]) - t0).dt.days.astype(int)
 
-    # Cycles (already in your code, but ensure existence)
+    # Cyclical encodings
     if "dow" not in df.columns:   df["dow"]   = pd.to_datetime(df[date_col]).dt.weekday
     if "month" not in df.columns: df["month"] = pd.to_datetime(df[date_col]).dt.month
-    for newc, arr in {
-        "dow_sin":   np.sin(2*np.pi*df["dow"]/7.0),
-        "dow_cos":   np.cos(2*np.pi*df["dow"]/7.0),
-        "month_sin": np.sin(2*np.pi*df["month"]/12.0),
-        "month_cos": np.cos(2*np.pi*df["month"]/12.0),
-    }.items():
-        if newc not in df.columns: df[newc] = arr
+    if "dow_sin" not in df.columns:   df["dow_sin"]   = np.sin(2*np.pi*df["dow"]/7.0)
+    if "dow_cos" not in df.columns:   df["dow_cos"]   = np.cos(2*np.pi*df["dow"]/7.0)
+    if "month_sin" not in df.columns: df["month_sin"] = np.sin(2*np.pi*df["month"]/12.0)
+    if "month_cos" not in df.columns: df["month_cos"] = np.cos(2*np.pi*df["month"]/12.0)
 
     base_covs  = ["max","min","precipitation","total_population","white_ratio","black_ratio","hh_median_income"]
     amen_feats = [c for c in df.columns if c.startswith("log1p_n_")]
@@ -422,37 +424,53 @@ def fit_predict_gam_st_robust(gdf, df, date_col="date", y_col="ground_truth",
     X_mat = df[X_cols].apply(pd.to_numeric, errors="coerce").fillna(0.0).values.astype(np.float32)
     scaler = StandardScaler().fit(X_mat)
     Xz = scaler.transform(X_mat).astype(np.float32)
-    y  = df[y_col].fillna(0).values.astype(np.float32)  # unlabeled rows as 0; they won't be used in training
+    y  = df[y_col].fillna(0).values.astype(np.float32)
 
-    # Train mask
+    # Train mask (labels only, up to 2023-12-31)
     train_mask = (pd.to_datetime(df[date_col]) <= pd.Timestamp("2023-12-31")) & df[y_col].notna()
     Xtr, ytr = Xz[train_mask], y[train_mask]
 
-    # Build terms:
-    # modest spatial surface + modest time smooth; keep others near-linear (2 knots)
-    nsp_space = 20  # less flexible than 30
+    # Terms: modest spatial/time smooth, others near-linear (tiny splines)
+    nsp_space = 20
     nsp_time  = 15
-    terms = te(0,1, n_splines=nsp_space, spline_order=3) + s(2, n_splines=nsp_time)
+    terms = te(0, 1, n_splines=nsp_space, spline_order=3) + s(2, n_splines=nsp_time)
 
-    # pseudo-random effect: penalized spline on a numeric grid index (optional)
     if use_pseudo_grid_re:
-        # Map grid id to 0..G-1
         grid_codes = pd.factorize(df[ID_COL])[0].astype(np.int32)
         df["_grid_code"] = grid_codes
-        X_cols.append("_grid_code")
-        # Append to Xz
-        Xz = np.column_stack([Xz, grid_codes.astype(np.float32)])
+        Xz  = np.column_stack([Xz, grid_codes.astype(np.float32)])
         Xtr = Xz[train_mask]
-        # Strong penalty, order 1 (ridge-like)
-        terms += s(len(X_cols)-1, n_splines= df[ID_COL].nunique()//50 + 2, spline_order=1)
+        # small, heavily penalized spline to mimic a random effect
+        terms += s(Xtr.shape[1]-1, n_splines=df[ID_COL].nunique()//50 + 2, spline_order=1)
 
-    # Time-blocked CV for smoothing params
-    tscv = TimeSeriesSplit(n_splits=5)
+    # Manual time-series CV over lam (because your pygam doesn't support cv=)
     lam_grid = np.logspace(0, 4, 7)  # stronger penalties than default
-    gam = PoissonGAM(terms, fit_intercept=True, max_iter=2000)
-    gam = gam.gridsearch(Xtr, ytr, lam=lam_grid, cv=tscv, progress=False)
+    tscv = TimeSeriesSplit(n_splits=n_splits)
 
-    # Predict mean rate
+    def _poisson_deviance(y_true, mu, eps=1e-9):
+        y_true = y_true.astype(float)
+        mu = np.clip(mu.astype(float), eps, None)
+        nz = y_true > 0
+        term = np.zeros_like(y_true, dtype=float)
+        term[nz] = y_true[nz] * np.log(y_true[nz] / mu[nz])
+        return 2.0 * np.mean(term - (y_true - mu))
+
+    best_lam, best_score = None, np.inf
+    for lam in lam_grid:
+        scores = []
+        for tr_idx, va_idx in tscv.split(Xtr):
+            gam = PoissonGAM(terms, fit_intercept=True, max_iter=2000, lam=lam)
+            gam.fit(Xtr[tr_idx], ytr[tr_idx])
+            mu = np.clip(gam.predict_mu(Xtr[va_idx]), 1e-6, None)
+            scores.append(_poisson_deviance(ytr[va_idx], mu))
+        mscore = float(np.mean(scores))
+        if mscore < best_score:
+            best_score, best_lam = mscore, lam
+
+    # Refit on full training with best_lam
+    gam = PoissonGAM(terms, fit_intercept=True, max_iter=2000, lam=best_lam)
+    gam.fit(Xtr, ytr)
+
     lam_hat = np.clip(gam.predict_mu(Xz), 1e-6, None)
     return lam_hat, "GAM_ST_robust"
 
